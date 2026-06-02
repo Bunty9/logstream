@@ -1,0 +1,27 @@
+[package]
+name = "logstream-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core types, tenant auth, OTLP mapping, and ClickHouse batcher for logstream."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
+clickhouse = { workspace = true }
+prost = { workspace = true }
+opentelemetry-proto = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }

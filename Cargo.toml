@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ingest",
+    "crates/query",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Runtime + HTTP
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-gzip"] }
+hyper = "1.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+hex = "0.4"
+
+# Database / cache
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "json"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+clickhouse = { version = "0.12", features = ["uuid", "time"] }
+
+# OTLP (protobuf)
+prost = "0.13"
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic-messages", "logs", "trace", "metrics"] }
+
+# Hashing for API keys
+blake3 = "1"
+
+# Observability — uniform across all projects
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# dev-dependencies that any workspace member may opt in to via
+# `[dev-dependencies]` + `workspace = true`.
+[workspace.dependencies.criterion]
+version = "0.5"
+
+[workspace.dependencies.proptest]
+version = "1"
+
+[workspace.dependencies.testcontainers]
+version = "0.23"
+
+[workspace.dependencies.testcontainers-modules]
+version = "0.11"
+features = ["postgres", "redis"]
+
+[workspace.dependencies.wiremock]
+version = "0.6"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,107 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # native
+    volumes:
+      - logstream_ch_data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: logstream
+      POSTGRES_PASSWORD: logstream
+      POSTGRES_DB: logstream
+    ports:
+      - "5432:5432"
+    volumes:
+      - logstream_pg_data:/var/lib/postgresql/data
+      - ./migrations/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logstream -d logstream"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    ports:
+      - "3000:3000"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - logstream_grafana_data:/var/lib/grafana
+
+  logstream-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      LOGSTREAM_BIND: 0.0.0.0:4318
+      DATABASE_URL: postgres://logstream:logstream@postgres:5432/logstream
+      REDIS_URL: redis://redis:6379
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: default
+      RUST_LOG: info
+    ports:
+      - "4318:4318"
+    entrypoint: ["/usr/local/bin/logstream-ingest"]
+
+  logstream-query:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      LOGSTREAM_QUERY_BIND: 0.0.0.0:4319
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: default
+      RUST_LOG: info
+    ports:
+      - "4319:4319"
+    entrypoint: ["/usr/local/bin/logstream-query"]
+
+volumes:
+  logstream_ch_data:
+  logstream_pg_data:
+  logstream_grafana_data:
