@@ -1,0 +1,28 @@
+apiVersion: 1
+
+datasources:
+  - name: logstream
+    type: loki
+    access: proxy
+    url: http://logstream-query:4319
+    isDefault: false
+    jsonData:
+      httpHeaderName1: x-api-key
+    secureJsonData:
+      httpHeaderValue1: $__env{LOGSTREAM_GRAFANA_API_KEY}
+
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    jsonData:
+      host: clickhouse
+      port: 8123
+      protocol: http
+      username: default
+      defaultDatabase: default
+
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false

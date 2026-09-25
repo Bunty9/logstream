@@ -7,8 +7,8 @@ services:
       CLICKHOUSE_PASSWORD: ""
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
-      - "8123:8123"   # HTTP
-      - "9000:9000"   # native
+      - "${CH_HTTP_PORT:-8123}:8123"   # HTTP
+      - "${CH_NATIVE_PORT:-9000}:9000"   # native
     volumes:
       - logstream_ch_data:/var/lib/clickhouse
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -29,7 +29,7 @@ services:
       POSTGRES_PASSWORD: logstream
       POSTGRES_DB: logstream
     ports:
-      - "5432:5432"
+      - "${PG_PORT:-5432}:5432"
     volumes:
       - logstream_pg_data:/var/lib/postgresql/data
       - ./migrations/0001_init.sql:/docker-entrypoint-initdb.d/0001_init.sql:ro
@@ -42,12 +42,23 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 20
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "${PROM_PORT:-9090}:9090"
+    volumes:
+      - ./grafana/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - logstream_prom_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
 
   grafana:
     image: grafana/grafana:11.2.0
@@ -55,15 +66,22 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      # API key for logstream datasource (dev-only default; set LOGSTREAM_GRAFANA_API_KEY env var in production)
+      LOGSTREAM_GRAFANA_API_KEY: ${LOGSTREAM_GRAFANA_API_KEY:-TESTKEY}
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     depends_on:
       clickhouse:
         condition: service_healthy
+      logstream-query:
+        condition: service_healthy
     volumes:
       - logstream_grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
 
   logstream-ingest:
+    image: logstream:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -82,26 +100,31 @@ services:
       CLICKHOUSE_DB: default
       RUST_LOG: info
     ports:
-      - "4318:4318"
+      - "${INGEST_PORT:-4318}:4318"
     entrypoint: ["/usr/local/bin/logstream-ingest"]
 
   logstream-query:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: logstream:local
     depends_on:
       clickhouse:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       LOGSTREAM_QUERY_BIND: 0.0.0.0:4319
+      DATABASE_URL: postgres://logstream:logstream@postgres:5432/logstream
+      REDIS_URL: redis://redis:6379
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: default
       RUST_LOG: info
     ports:
-      - "4319:4319"
+      - "${QUERY_PORT:-4319}:4319"
     entrypoint: ["/usr/local/bin/logstream-query"]
 
 volumes:
   logstream_ch_data:
   logstream_pg_data:
   logstream_grafana_data:
+  logstream_prom_data:

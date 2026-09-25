@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Grafana-compatible read API for logstream — thin SELECT layer over ClickHouse."
 
+[lib]
+name = "logstream_query"
+path = "src/lib.rs"
+
 [[bin]]
 name = "logstream-query"
 path = "src/main.rs"
@@ -16,6 +20,8 @@ tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
+sqlx = { workspace = true }
+redis = { workspace = true }
 clickhouse = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,3 +32,14 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 clap = { workspace = true }
+# Not a workspace dep: only needed here for RFC3339 parsing on the
+# query-time surface. Already in the lockfile transitively (the
+# `clickhouse` crate itself depends on `time`), so this doesn't add a new
+# crate to the dependency tree — just enables the `parsing` feature we use
+# directly.
+time = { version = "0.3", features = ["parsing"] }
+
+[dev-dependencies]
+# `util` for `ServiceExt::oneshot` in handler tests; not needed by the
+# binary itself, hence dev-only rather than bumping the shared feature set.
+tower = { workspace = true, features = ["util"] }

@@ -15,7 +15,7 @@ logstream-core = { path = "../core" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["decompression-gzip"] }
 sqlx = { workspace = true }
 redis = { workspace = true }
 clickhouse = { workspace = true }
@@ -31,3 +31,10 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+# `util` for `ServiceExt::oneshot` in handler tests; not needed by the
+# binary itself, hence dev-only rather than bumping the shared feature set.
+tower = { workspace = true, features = ["util"] }
+blake3 = { workspace = true }
+flate2 = "1"
