@@ -12,7 +12,18 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Accepted timestamp window, relative to `now`: the `logs` table is
+/// `PARTITION BY toYYYYMMDD(ts)` with a 30-day TTL, and ClickHouse refuses
+/// an INSERT that touches more than 100 partitions — so a single client
+/// with a wrong clock (or backfilling months of history) mixed into a
+/// multi-tenant batch can fail the whole flush and drop every tenant's
+/// acked rows. Clamping every accepted `ts` to `[now - TTL, now + skew]`
+/// keeps a batch's partition spread bounded no matter what a client sends.
+const TS_WINDOW_PAST_NS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days, matches the table TTL
+const TS_WINDOW_FUTURE_NS: i64 = 60 * 60 * 1_000_000_000; // 1h of tolerated clock skew
 
 /// Project an OTLP logs request into the row representation persisted in
 /// ClickHouse. Tenant id is supplied by the auth layer — OTLP itself has
@@ -26,22 +37,32 @@ pub fn otlp_to_rows(tenant_id: String, req: &ExportLogsServiceRequest) -> Vec<Lo
         .sum();
     let mut rows = Vec::with_capacity(total);
 
+    // Built once per request/resource and cloned (an `Arc` refcount bump)
+    // per row rather than deep-cloned — see `LogRow`'s doc comment.
+    let tenant_id: Arc<str> = Arc::from(tenant_id);
+    let now = SystemTime::now();
+
     for resource_logs in &req.resource_logs {
         let resource = resource_logs
             .resource
             .as_ref()
             .map(|r| flatten_kvs(&r.attributes))
             .unwrap_or_default();
-        let service = resource
+        let service: Arc<str> = resource
             .get("service.name")
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|s| Arc::from(s.as_str()))
+            .unwrap_or_else(|| Arc::from("unknown"));
+        let resource: Arc<BTreeMap<String, String>> = Arc::new(resource);
 
         for scope_logs in &resource_logs.scope_logs {
             for record in &scope_logs.log_records {
+                let (ts, clamped) = row_ts_at(record, now);
+                if clamped {
+                    metrics::counter!("logstream_ts_clamped_total").increment(1);
+                }
                 rows.push(LogRow {
                     tenant_id: tenant_id.clone(),
-                    ts: row_ts(record),
+                    ts,
                     severity: row_severity(record),
                     service: service.clone(),
                     trace_id: hex_id(&record.trace_id, 16),
@@ -60,21 +81,37 @@ pub fn otlp_to_rows(tenant_id: String, req: &ExportLogsServiceRequest) -> Vec<Lo
     rows
 }
 
-/// `time_unix_nano` if set, else `observed_time_unix_nano`, else wall-clock
-/// now — as nanoseconds since the Unix epoch, saturating rather than
-/// panicking if a u64 timestamp doesn't fit in `i64`.
-fn row_ts(record: &LogRecord) -> i64 {
-    let nanos = if record.time_unix_nano != 0 {
-        record.time_unix_nano
-    } else if record.observed_time_unix_nano != 0 {
-        record.observed_time_unix_nano
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or(0)
+/// `time_unix_nano` if set and within `[now - 30d, now + 1h]`, else
+/// `observed_time_unix_nano` under the same window, else `now` — see the
+/// module-level `TS_WINDOW_*` docs for why out-of-window timestamps are
+/// rejected instead of trusted verbatim. `now` is a parameter (rather than
+/// reading `SystemTime::now()` internally) so tests are deterministic;
+/// `otlp_to_rows` is the only caller and always passes real wall-clock
+/// time. Returns `(ts, was_clamped)`, where `was_clamped` is true whenever
+/// the result isn't `record.time_unix_nano` taken as-is.
+fn row_ts_at(record: &LogRecord, now: SystemTime) -> (i64, bool) {
+    let now_ns = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+
+    let in_window = |nanos: u64| -> Option<i64> {
+        if nanos == 0 {
+            return None;
+        }
+        let ts = nanos.min(i64::MAX as u64) as i64;
+        let lo = now_ns.saturating_sub(TS_WINDOW_PAST_NS);
+        let hi = now_ns.saturating_add(TS_WINDOW_FUTURE_NS);
+        (ts >= lo && ts <= hi).then_some(ts)
     };
-    nanos.min(i64::MAX as u64) as i64
+
+    if let Some(ts) = in_window(record.time_unix_nano) {
+        return (ts, false);
+    }
+    if let Some(ts) = in_window(record.observed_time_unix_nano) {
+        return (ts, true);
+    }
+    (now_ns, true)
 }
 
 /// Map OTLP `severity_number` ranges onto our fixed severity vocabulary,
@@ -216,6 +253,10 @@ mod tests {
         req(resource(vec![]), vec![vec![record]])
     }
 
+    fn now_ns(now: SystemTime) -> i64 {
+        now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64
+    }
+
     #[test]
     fn severity_number_ranges() {
         let cases = [
@@ -259,46 +300,104 @@ mod tests {
         assert_eq!(rows[0].severity, "UNSPECIFIED");
     }
 
+    // --- ts clamping (`row_ts_at`), tested directly with a fixed `now` for
+    // determinism --------------------------------------------------------
+
     #[test]
-    fn ts_uses_time_unix_nano_when_present() {
+    fn ts_within_window_is_used_as_is() {
+        let now = SystemTime::now();
+        let ts = now_ns(now) - 60_000_000_000; // 1 minute ago
         let record = LogRecord {
-            time_unix_nano: 42,
-            observed_time_unix_nano: 99,
+            time_unix_nano: ts as u64,
             ..Default::default()
         };
-        let rows = otlp_to_rows("t".into(), &one_record_req(record));
-        assert_eq!(rows[0].ts, 42);
+        let (got, clamped) = row_ts_at(&record, now);
+        assert_eq!(got, ts);
+        assert!(!clamped);
     }
 
     #[test]
-    fn ts_falls_back_to_observed_time() {
+    fn ts_too_far_in_past_falls_back_to_observed_time() {
+        let now = SystemTime::now();
+        let stale = now_ns(now) - 40 * 24 * 60 * 60 * 1_000_000_000i64; // 40 days ago
+        let observed = now_ns(now) - 5_000_000_000; // 5s ago, in window
         let record = LogRecord {
-            time_unix_nano: 0,
-            observed_time_unix_nano: 99,
+            time_unix_nano: stale as u64,
+            observed_time_unix_nano: observed as u64,
             ..Default::default()
         };
-        let rows = otlp_to_rows("t".into(), &one_record_req(record));
-        assert_eq!(rows[0].ts, 99);
+        let (got, clamped) = row_ts_at(&record, now);
+        assert_eq!(got, observed);
+        assert!(clamped);
+    }
+
+    #[test]
+    fn ts_too_far_in_future_falls_back_to_observed_time() {
+        let now = SystemTime::now();
+        let far_future = now_ns(now) + 2 * 60 * 60 * 1_000_000_000i64; // 2h ahead
+        let observed = now_ns(now);
+        let record = LogRecord {
+            time_unix_nano: far_future as u64,
+            observed_time_unix_nano: observed as u64,
+            ..Default::default()
+        };
+        let (got, clamped) = row_ts_at(&record, now);
+        assert_eq!(got, observed);
+        assert!(clamped);
+    }
+
+    #[test]
+    fn ts_and_observed_both_out_of_window_falls_back_to_now() {
+        let now = SystemTime::now();
+        let stale = now_ns(now) - 365 * 24 * 60 * 60 * 1_000_000_000i64; // 1y ago
+        let record = LogRecord {
+            time_unix_nano: stale as u64,
+            observed_time_unix_nano: stale as u64,
+            ..Default::default()
+        };
+        let (got, clamped) = row_ts_at(&record, now);
+        assert_eq!(got, now_ns(now));
+        assert!(clamped);
+    }
+
+    #[test]
+    fn ts_falls_back_to_observed_time_when_missing() {
+        let now = SystemTime::now();
+        let observed = now_ns(now) - 1_000_000_000;
+        let record = LogRecord {
+            time_unix_nano: 0,
+            observed_time_unix_nano: observed as u64,
+            ..Default::default()
+        };
+        let (got, clamped) = row_ts_at(&record, now);
+        assert_eq!(got, observed);
+        assert!(clamped);
     }
 
     #[test]
     fn ts_falls_back_to_now_when_both_unset() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        let rows = otlp_to_rows("t".into(), &one_record_req(LogRecord::default()));
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64;
-        assert!(rows[0].ts >= before && rows[0].ts <= after);
+        let now = SystemTime::now();
+        let (got, clamped) = row_ts_at(&LogRecord::default(), now);
+        assert_eq!(got, now_ns(now));
+        assert!(clamped);
+    }
+
+    #[test]
+    fn otlp_to_rows_uses_time_unix_nano_when_in_window() {
+        let now = now_ns(SystemTime::now());
+        let ts = now - 1_000_000_000;
+        let record = LogRecord {
+            time_unix_nano: ts as u64,
+            ..Default::default()
+        };
+        let rows = otlp_to_rows("t".into(), &one_record_req(record));
+        assert_eq!(rows[0].ts, ts);
     }
 
     #[test]
     fn service_defaults_to_unknown_without_service_name() {
         let rows = otlp_to_rows("t".into(), &one_record_req(LogRecord::default()));
-        assert_eq!(rows[0].service, "unknown");
+        assert_eq!(&*rows[0].service, "unknown");
     }
 
     #[test]
@@ -308,7 +407,7 @@ mod tests {
             AnyValueKind::StringValue("checkout".into()),
         )]);
         let rows = otlp_to_rows("t".into(), &req(res, vec![vec![LogRecord::default()]]));
-        assert_eq!(rows[0].service, "checkout");
+        assert_eq!(&*rows[0].service, "checkout");
         // service.name stays in the resource map too.
         assert_eq!(
             rows[0].resource.get("service.name"),
@@ -450,9 +549,34 @@ mod tests {
 
         let rows = otlp_to_rows("tenant".into(), &request);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].service, "a");
-        assert_eq!(rows[1].service, "a");
-        assert_eq!(rows[2].service, "b");
-        assert!(rows.iter().all(|r| r.tenant_id == "tenant"));
+        assert_eq!(&*rows[0].service, "a");
+        assert_eq!(&*rows[1].service, "a");
+        assert_eq!(&*rows[2].service, "b");
+        assert!(rows.iter().all(|r| &*r.tenant_id == "tenant"));
+    }
+
+    #[test]
+    fn resource_and_service_are_shared_via_arc_not_cloned_per_record() {
+        let res = resource(vec![kv(
+            "service.name",
+            AnyValueKind::StringValue("svc".into()),
+        )]);
+        let rows = otlp_to_rows(
+            "tenant".into(),
+            &req(res, vec![vec![LogRecord::default(), LogRecord::default()]]),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(
+            Arc::ptr_eq(&rows[0].resource, &rows[1].resource),
+            "resource map is shared across rows from the same resource_logs entry"
+        );
+        assert!(
+            Arc::ptr_eq(&rows[0].service, &rows[1].service),
+            "service is shared across rows from the same resource_logs entry"
+        );
+        assert!(
+            Arc::ptr_eq(&rows[0].tenant_id, &rows[1].tenant_id),
+            "tenant_id is shared across every row in the request"
+        );
     }
 }

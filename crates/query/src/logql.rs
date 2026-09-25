@@ -10,9 +10,12 @@
 //! label      := [a-zA-Z_][a-zA-Z0-9_]*
 //! ```
 //!
-//! A stream selector needs at least one matcher — an empty `{}` would mean
-//! "every row for every tenant" once translated to SQL, so (like Loki) we
-//! reject it outright rather than special-case an unbounded scan.
+//! A stream selector needs at least one matcher — every translated query
+//! always filters on the resolved tenant regardless of what's in `{}`
+//! (see `sql::translate`), so an empty `{}` would still be scoped to one
+//! tenant, not every tenant, but it would mean an unbounded scan of that
+//! tenant's entire history. So (like Loki) we reject it outright rather
+//! than special-case a full-history scan.
 //!
 //! No parser combinator crate: the grammar is small enough that hand
 //! rolling it is both less code and gives us exact byte-offset error

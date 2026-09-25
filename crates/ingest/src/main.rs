@@ -17,32 +17,18 @@ use clap::Parser;
 use ingest::AppState;
 use logstream_core::{run_batcher, TenantAuth, TenantBatch};
 use sqlx::postgres::PgPoolOptions;
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 
-/// Object-safe tenant lookup so ingest handler tests can swap in a static
-/// map instead of standing up Postgres + Redis (`async fn` in traits isn't
-/// dyn-safe yet, hence the manual boxed future). `TenantAuth::lookup`
-/// (`crates/core/src/auth.rs`) is the real implementation; the ingest ↔
-/// core contract is just its `new(redis: ConnectionManager, pg: PgPool)`
-/// and `lookup(&self, api_key: &str) -> Option<String>` signatures.
-pub trait TenantLookup: Send + Sync {
-    fn lookup<'a>(
-        &'a self,
-        api_key: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
-}
-
-impl TenantLookup for TenantAuth {
-    fn lookup<'a>(
-        &'a self,
-        api_key: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
-        Box::pin(TenantAuth::lookup(self, api_key))
-    }
-}
+/// Re-exported so `ingest.rs` and its tests can name it as `crate::TenantLookup`
+/// without reaching into `logstream_core` directly everywhere; the real
+/// trait + the `TenantAuth` impl of it live in `logstream_core::auth` (also
+/// used by `logstream-query`, so there's exactly one copy of this seam).
+pub use logstream_core::TenantLookup;
 
 const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_BUFFERED_ROWS: usize = 1_000_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "logstream-ingest", about = "logstream OTLP-HTTP ingest")]
@@ -82,6 +68,14 @@ struct Args {
     /// Max accepted request body size, in bytes (post gzip-decompression).
     #[arg(long, env = "LOGSTREAM_MAX_BODY_BYTES", default_value_t = DEFAULT_MAX_BODY_BYTES)]
     max_body_bytes: usize,
+
+    /// Max total rows buffered in-flight at once (channel + batcher
+    /// buffer combined). Bounds worst-case memory: a 16 MiB request can
+    /// decode into millions of tiny `LogRow`s, and the channel is bounded
+    /// by batch count, not row count, so without this a handful of huge
+    /// requests can still exhaust memory before the channel looks full.
+    #[arg(long, env = "LOGSTREAM_MAX_BUFFERED_ROWS", default_value_t = DEFAULT_MAX_BUFFERED_ROWS)]
+    max_buffered_rows: usize,
 }
 
 #[tokio::main]
@@ -115,11 +109,18 @@ async fn main() -> anyhow::Result<()> {
     let flush_ms = args.flush_ms;
     let batcher_handle = tokio::spawn(run_batcher(rx, ch, max_rows, flush_ms));
 
-    let state = AppState { auth, sender: tx };
+    let buffer_limit = Arc::new(Semaphore::new(args.max_buffered_rows));
+    let state = AppState {
+        auth,
+        sender: tx,
+        buffer_limit,
+        max_buffered_rows: args.max_buffered_rows,
+        max_body_bytes: args.max_body_bytes,
+    };
 
     let prometheus_handle =
         metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
-    let app = ingest::app(state, args.max_body_bytes).route(
+    let app = ingest::app(state).route(
         "/metrics",
         get(move || {
             let handle = prometheus_handle.clone();

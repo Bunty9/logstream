@@ -1,52 +1,73 @@
 //! Time-value parsing shared by `POST /query` and the `/loki/api/v1/*`
-//! routes, plus the `end=now, start=end-1h` default window used
-//! everywhere rows are looked up by time range.
+//! routes, plus the `end=now, start=end-1h` default window (clamped to a
+//! max span) used everywhere rows are looked up by time range.
 //!
-//! Accepted shapes (matching what the phase-3 spec asks for): a plain
-//! integer is nanoseconds since the Unix epoch; a value with a decimal
-//! point is Loki-style fractional unix *seconds*; anything else is tried
-//! as RFC3339. That's an unambiguous, order-independent rule (no
-//! magnitude heuristics) so the same parser serves both `POST /query`'s
-//! own surface and Loki's more permissive one.
+//! Accepted shapes, matching Loki's own `parseTimestamp`: a value with a
+//! decimal point is fractional unix *seconds*; a plain integer string of
+//! at most 10 digits is unix *seconds* (10 digits covers every unix
+//! second through the year 2286), otherwise it's nanoseconds; anything
+//! else is tried as RFC3339. This is a deliberate magnitude heuristic —
+//! Loki's own rule — kept so `/loki/api/v1/*` clients that assume Loki's
+//! semantics get them; `POST /query`'s own numeric `start`/`end` follow
+//! the same rule for consistency between the two surfaces rather than
+//! silently disagreeing on what a bare number means.
 
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const DEFAULT_RANGE_NS: i64 = 3_600_000_000_000; // 1h
+/// Server-side cap on `end - start`, applied by `resolve_range` regardless
+/// of what the client asks for — bounds the partition/row scan cost of a
+/// single query. Loki-style silent clamp (not a `400`): a dashboard panel
+/// that's slightly too wide still returns data for the clamped window
+/// instead of erroring.
+pub const MAX_RANGE_NS: i64 = 31 * 24 * 3_600 * 1_000_000_000; // 31 days
 
 pub fn now_ns() -> i64 {
     (OffsetDateTime::now_utc().unix_timestamp_nanos()) as i64
 }
 
+/// A bare integer, per Loki's `parseTimestamp`: <=10 digits is unix
+/// seconds (converted to nanoseconds), otherwise it's already nanoseconds.
+fn int_to_ns(n: i64) -> i64 {
+    let digits = n.unsigned_abs().to_string().len();
+    if digits <= 10 {
+        n.saturating_mul(1_000_000_000)
+    } else {
+        n
+    }
+}
+
 /// Parse a query-string time value (`?start=...&end=...`).
 pub fn parse_str_to_ns(raw: &str) -> Result<i64, String> {
-    if let Ok(ns) = raw.parse::<i64>() {
-        return Ok(ns);
-    }
     if raw.contains('.') {
         if let Ok(secs) = raw.parse::<f64>() {
             return Ok((secs * 1_000_000_000.0).round() as i64);
         }
+    } else if let Ok(n) = raw.parse::<i64>() {
+        return Ok(int_to_ns(n));
     }
     OffsetDateTime::parse(raw, &Rfc3339)
         .map(|dt| dt.unix_timestamp_nanos() as i64)
         .map_err(|_| {
             format!(
-                "invalid time value '{raw}': expected unix nanoseconds, \
-                 fractional unix seconds, or RFC3339"
+                "invalid time value '{raw}': expected unix seconds (<=10 digits), unix \
+                 nanoseconds, fractional unix seconds, or RFC3339"
             )
         })
 }
 
 /// Parse a JSON body time value (`{"start": ..., "end": ...}`), which may
-/// be a number (nanoseconds, or seconds if it has a fractional part) or a
-/// string (same rules as `parse_str_to_ns`).
+/// be a number (seconds if <=10 digits else nanoseconds, or fractional
+/// seconds — same magnitude rule as `parse_str_to_ns`, for consistency) or
+/// a string (same rules as `parse_str_to_ns`).
 pub fn parse_json_to_ns(v: &Value) -> Result<i64, String> {
     match v {
         Value::String(s) => parse_str_to_ns(s),
         Value::Number(n) => {
             if n.is_i64() || n.is_u64() {
                 n.as_i64()
+                    .map(int_to_ns)
                     .ok_or_else(|| "time value out of range".to_string())
             } else {
                 n.as_f64()
@@ -58,10 +79,12 @@ pub fn parse_json_to_ns(v: &Value) -> Result<i64, String> {
     }
 }
 
-/// Apply the shared `end=now, start=end-1h` default.
+/// Apply the shared `end=now, start=end-1h` default, then clamp the
+/// resulting span to `MAX_RANGE_NS` (see its doc).
 pub fn resolve_range(start: Option<i64>, end: Option<i64>) -> (i64, i64) {
     let end = end.unwrap_or_else(now_ns);
     let start = start.unwrap_or(end - DEFAULT_RANGE_NS);
+    let start = start.max(end - MAX_RANGE_NS);
     (start, end)
 }
 
@@ -70,8 +93,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_ns_integer() {
-        assert_eq!(parse_str_to_ns("1234567890").unwrap(), 1_234_567_890);
+    fn short_integer_string_is_unix_seconds() {
+        // 10 digits or fewer => seconds, per Loki's parseTimestamp.
+        assert_eq!(
+            parse_str_to_ns("1234567890").unwrap(),
+            1_234_567_890_000_000_000
+        );
+    }
+
+    #[test]
+    fn long_integer_string_is_nanoseconds() {
+        // More than 10 digits => already nanoseconds, used as-is.
+        assert_eq!(parse_str_to_ns("12345678901").unwrap(), 12_345_678_901);
+        assert_eq!(
+            parse_str_to_ns("1700000000000000000").unwrap(),
+            1_700_000_000_000_000_000
+        );
     }
 
     #[test]
@@ -91,8 +128,16 @@ mod tests {
     }
 
     #[test]
-    fn json_number_is_ns() {
-        assert_eq!(parse_json_to_ns(&Value::from(42)).unwrap(), 42);
+    fn json_short_integer_is_seconds() {
+        assert_eq!(parse_json_to_ns(&Value::from(42)).unwrap(), 42_000_000_000);
+    }
+
+    #[test]
+    fn json_long_integer_is_nanoseconds() {
+        assert_eq!(
+            parse_json_to_ns(&Value::from(1_700_000_000_000_000_000i64)).unwrap(),
+            1_700_000_000_000_000_000
+        );
     }
 
     #[test]
@@ -102,7 +147,10 @@ mod tests {
 
     #[test]
     fn json_string_delegates() {
-        assert_eq!(parse_json_to_ns(&Value::from("100")).unwrap(), 100);
+        assert_eq!(
+            parse_json_to_ns(&Value::from("100")).unwrap(),
+            100_000_000_000
+        );
     }
 
     #[test]
@@ -110,5 +158,20 @@ mod tests {
         let (start, end) = resolve_range(None, Some(10 * DEFAULT_RANGE_NS));
         assert_eq!(start, 9 * DEFAULT_RANGE_NS);
         assert_eq!(end, 10 * DEFAULT_RANGE_NS);
+    }
+
+    #[test]
+    fn range_wider_than_max_is_clamped() {
+        let end = 100 * MAX_RANGE_NS;
+        let (start, clamped_end) = resolve_range(Some(0), Some(end));
+        assert_eq!(clamped_end, end);
+        assert_eq!(start, end - MAX_RANGE_NS);
+    }
+
+    #[test]
+    fn range_within_max_is_untouched() {
+        let (start, end) = resolve_range(Some(1_000), Some(1_000 + DEFAULT_RANGE_NS));
+        assert_eq!(start, 1_000);
+        assert_eq!(end, 1_000 + DEFAULT_RANGE_NS);
     }
 }

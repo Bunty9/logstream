@@ -74,6 +74,10 @@ fn err_loki(status: StatusCode, msg: impl Into<String>) -> JsonErr {
 
 /// Resolve `x-api-key`/`Authorization: Bearer` to a tenant id, or a
 /// `(status, message)` the caller wraps in its own error envelope.
+///
+/// A backend failure (Postgres unreachable — see `AuthError`) is `503`,
+/// not `401`: we genuinely don't know whether the key is valid, and OTLP/
+/// Loki clients treat those very differently (retry vs. drop).
 async fn require_tenant(
     state: &AppState,
     headers: &HeaderMap,
@@ -82,11 +86,17 @@ async fn require_tenant(
         StatusCode::UNAUTHORIZED,
         "missing x-api-key or Authorization: Bearer".to_string(),
     ))?;
-    state
-        .auth
-        .lookup(key)
-        .await
-        .ok_or((StatusCode::UNAUTHORIZED, "invalid API key".to_string()))
+    match state.auth.lookup(key).await {
+        Ok(Some(tenant_id)) => Ok(tenant_id),
+        Ok(None) => Err((StatusCode::UNAUTHORIZED, "invalid API key".to_string())),
+        Err(err) => {
+            tracing::error!(%err, "tenant auth backend unavailable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "auth backend unavailable".to_string(),
+            ))
+        }
+    }
 }
 
 fn bind_one(q: clickhouse::query::Query, b: Bind) -> clickhouse::query::Query {
@@ -96,13 +106,39 @@ fn bind_one(q: clickhouse::query::Query, b: Bind) -> clickhouse::query::Query {
     }
 }
 
-/// ClickHouse errors surfacing a bad query (e.g. an invalid re2 pattern
-/// from `=~`) come back as `Error::BadResponse` with ClickHouse's own
-/// message — that's a client mistake, so it's a 400, not a 500.
+/// ClickHouse exception codes that mean the *client* asked for something
+/// bad (an unparseable regex, invalid SQL our own translation produced
+/// from bad-but-not-rejected-by-`logql::parse` input) rather than the
+/// server being unhealthy. Kept deliberately tiny — a code only belongs
+/// here if you can point at the exact user input that trips it; anything
+/// else risks turning a real outage into a swallowed 400.
+const USER_ERROR_CODES: &[(&str, &str)] = &[
+    ("Code: 427", "invalid regular expression in query"),
+    ("Code: 62", "invalid query syntax"),
+];
+
+/// Map a ClickHouse error to a client-facing status + sanitized message.
+/// The raw ClickHouse exception text (which can include table/column
+/// names, stack-ish detail, or just be plain noisy) never reaches the
+/// client — only a fixed, sanitized message for the known-user-error
+/// cases, or a generic "upstream error" otherwise. The full error is
+/// always logged at `error` level so an operator can still see it.
 fn ch_err(e: clickhouse::error::Error) -> (StatusCode, String) {
-    match e {
-        clickhouse::error::Error::BadResponse(msg) => (StatusCode::BAD_REQUEST, msg),
-        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    tracing::error!(err = %e, "clickhouse query failed");
+    match &e {
+        clickhouse::error::Error::BadResponse(msg) => {
+            for (code, sanitized) in USER_ERROR_CODES {
+                if msg.contains(code) {
+                    return (StatusCode::BAD_REQUEST, sanitized.to_string());
+                }
+            }
+            (StatusCode::BAD_GATEWAY, "upstream error".to_string())
+        }
+        clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream error".to_string(),
+        ),
+        _ => (StatusCode::BAD_GATEWAY, "upstream error".to_string()),
     }
 }
 
@@ -433,7 +469,7 @@ async fn loki_label_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::test_support::FakeAuth;
+    use crate::auth::test_support::{FailingAuth, FakeAuth};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -456,6 +492,10 @@ mod tests {
         state(Arc::new(FakeAuth(None)))
     }
 
+    fn failing_auth_state() -> AppState {
+        state(Arc::new(FailingAuth))
+    }
+
     #[tokio::test]
     async fn query_without_api_key_is_401() {
         let app = build_router(authed_state());
@@ -467,6 +507,20 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn query_with_auth_backend_failure_is_503() {
+        let app = build_router(failing_auth_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .header("x-api-key", "k")
+            .body(Body::from(r#"{"query":"{service=\"api\"}"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -597,6 +651,38 @@ mod tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["status"], "error");
         assert!(v["error"].is_string());
+    }
+
+    #[test]
+    fn ch_err_maps_user_regexp_error_to_sanitized_400() {
+        let e = clickhouse::error::Error::BadResponse(
+            "Code: 427. DB::Exception: Cannot compile regular expression: (unmatched paren"
+                .to_string(),
+        );
+        let (status, msg) = ch_err(e);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !msg.contains("DB::Exception"),
+            "raw clickhouse exception text must not reach the client: {msg}"
+        );
+    }
+
+    #[test]
+    fn ch_err_maps_other_bad_response_to_502_generic_message() {
+        let e = clickhouse::error::Error::BadResponse(
+            "Code: 999. DB::Exception: some internal detail".to_string(),
+        );
+        let (status, msg) = ch_err(e);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(msg, "upstream error");
+    }
+
+    #[test]
+    fn ch_err_maps_network_error_to_503() {
+        let e = clickhouse::error::Error::Network(Box::new(std::io::Error::other("boom")));
+        let (status, msg) = ch_err(e);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(msg, "upstream error");
     }
 
     #[test]

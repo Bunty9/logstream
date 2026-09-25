@@ -5,7 +5,10 @@
 //!
 //! Backpressure is intentionally drop-newest at the ingest boundary
 //! (see `crates/ingest/src/ingest.rs`); the batcher itself never blocks
-//! recv() because the channel does that for us.
+//! recv() because the channel does that for us. Total in-flight rows
+//! (channel + this buffer) are additionally bounded by the
+//! `--max-buffered-rows` semaphore permit each `TenantBatch` carries — see
+//! that permit's handling in the loop below.
 //!
 //! A flush failure is non-fatal: it's logged, counted, and the buffered
 //! rows are dropped so the batcher keeps running — one bad flush must not
@@ -16,6 +19,7 @@
 
 use crate::types::{LogRow, TenantBatch};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 
 /// Bounded retry for a transient flush failure. Kept small and simple:
@@ -44,6 +48,14 @@ pub async fn run_batcher(
     flush_ms: u64,
 ) -> anyhow::Result<()> {
     let mut buf: Vec<LogRow> = Vec::with_capacity(max_rows * 2);
+    // Accumulated `--max-buffered-rows` permits covering every row
+    // currently in `buf`. Each incoming `TenantBatch`'s permit is merged
+    // into this one (`OwnedSemaphorePermit::merge`, cheap — just adds
+    // permit counts), and it's released (dropped) the instant `buf` is
+    // drained by a flush, whether that flush succeeds or exhausts its
+    // retries and drops the rows — either way the rows it covered are no
+    // longer buffered anywhere.
+    let mut permit: Option<OwnedSemaphorePermit> = None;
     let mut tick = interval(Duration::from_millis(flush_ms));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -52,8 +64,13 @@ pub async fn run_batcher(
                 match maybe_batch {
                     Some(batch) => {
                         buf.extend(batch.rows);
+                        match &mut permit {
+                            Some(p) => p.merge(batch.permit),
+                            None => permit = Some(batch.permit),
+                        }
                         if buf.len() >= max_rows {
                             flush_with_retry(&ch, &mut buf).await;
+                            permit.take();
                         }
                     }
                     None => break, // sender side dropped — shutdown
@@ -62,12 +79,14 @@ pub async fn run_batcher(
             _ = tick.tick() => {
                 if !buf.is_empty() {
                     flush_with_retry(&ch, &mut buf).await;
+                    permit.take();
                 }
             }
         }
     }
     if !buf.is_empty() {
         flush_with_retry(&ch, &mut buf).await;
+        permit.take();
     }
     Ok(())
 }
@@ -95,8 +114,12 @@ async fn flush_with_retry(ch: &clickhouse::Client, buf: &mut Vec<LogRow>) {
     }
 }
 
-/// Drain `buf` into a single ClickHouse insert. Public so the ingest binary
-/// can call it on shutdown if the channel is closed mid-batch.
+/// Drain `buf` into a single ClickHouse insert. Public only so integration
+/// tests (`crates/ingest/tests/clickhouse_it.rs`) can exercise one flush
+/// directly against a real ClickHouse server without driving the full
+/// `run_batcher` actor loop — nothing in the ingest binary calls this
+/// directly; `run_batcher` (via `flush_with_retry`) is the only production
+/// caller.
 ///
 /// Note: if `insert.end()` fails after some rows were already accepted by
 /// ClickHouse (e.g. the connection dropped mid-write), a caller that

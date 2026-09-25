@@ -74,7 +74,10 @@ async fn cache_key_is_hashed_not_plaintext() {
         .expect("redis connection manager");
     let auth = TenantAuth::new(manager, pg);
 
-    let tenant = auth.lookup(api_key).await;
+    let tenant = auth
+        .lookup(api_key)
+        .await
+        .expect("lookup backend call succeeds");
     assert_eq!(
         tenant.as_deref(),
         Some("demo-it"),
@@ -103,5 +106,77 @@ async fn cache_key_is_hashed_not_plaintext() {
         hashed.as_deref(),
         Some("demo-it"),
         "cache is keyed by the blake3 hash"
+    );
+}
+
+/// Verifies the negative-caching fix in `crates/core/src/auth.rs`: an
+/// unknown key resolves to `Ok(None)` (not an error), and the miss gets
+/// cached in Redis as an empty-string sentinel with a short TTL — so a
+/// flood of requests using a never-valid key doesn't hit Postgres on every
+/// single one of them.
+#[tokio::test]
+async fn unknown_key_is_negative_cached() {
+    let (Ok(pg_url), Ok(redis_url)) = (
+        std::env::var("LOGSTREAM_IT_PG_URL"),
+        std::env::var("LOGSTREAM_IT_REDIS_URL"),
+    ) else {
+        println!(
+            "skipping unknown_key_is_negative_cached: set LOGSTREAM_IT_PG_URL and \
+             LOGSTREAM_IT_REDIS_URL to run against real Postgres + Redis"
+        );
+        return;
+    };
+
+    let pg = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&pg_url)
+        .await
+        .expect("connect to postgres");
+
+    let migration_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/0001_init.sql"
+    );
+    let migration = std::fs::read_to_string(migration_path).expect("read migrations/0001_init.sql");
+    for stmt in migration
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Idempotent re-apply across test binaries sharing one container.
+        sqlx::query(stmt).execute(&pg).await.ok();
+    }
+
+    let redis_client = redis::Client::open(redis_url).expect("open redis client");
+    let manager = redis_client
+        .get_connection_manager()
+        .await
+        .expect("redis connection manager");
+    let auth = TenantAuth::new(manager, pg);
+
+    let api_key = "TESTKEY-never-issued";
+    let key_hash = blake3::hash(api_key.as_bytes()).to_hex().to_string();
+
+    let tenant = auth
+        .lookup(api_key)
+        .await
+        .expect("lookup backend call succeeds");
+    assert_eq!(
+        tenant, None,
+        "an unknown key resolves to Ok(None), not an error"
+    );
+
+    let mut raw = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw redis connection");
+    let cached: Option<String> = raw
+        .get(format!("tenant:{key_hash}"))
+        .await
+        .expect("redis GET");
+    assert_eq!(
+        cached.as_deref(),
+        Some(""),
+        "an unknown key is negative-cached as an empty-string sentinel"
     );
 }

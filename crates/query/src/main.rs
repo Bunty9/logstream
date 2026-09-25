@@ -12,6 +12,7 @@ use logstream_query::handlers::{self, AppState};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::postgres::PgPoolOptions;
 use std::{net::SocketAddr, sync::Arc};
+use tower::limit::ConcurrencyLimitLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,13 @@ struct Args {
     /// ClickHouse database.
     #[arg(long, env = "CLICKHOUSE_DB", default_value = "default")]
     clickhouse_db: String,
+
+    /// Max requests served concurrently by the query routes (`/query`,
+    /// `/trace/*`, `/loki/*`); excess requests wait rather than piling
+    /// more concurrent ClickHouse queries onto the server. `/health` and
+    /// `/metrics` are not limited.
+    #[arg(long, env = "LOGSTREAM_MAX_CONCURRENT_QUERIES", default_value_t = 16)]
+    max_concurrent_queries: usize,
 }
 
 #[tokio::main]
@@ -58,9 +66,15 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let auth: Arc<dyn auth::TenantResolver> = Arc::new(TenantAuth::new(redis, pg));
 
+    // `max_execution_time` bounds a single query's cost on the server side
+    // regardless of what `LIMIT` the translated SQL carries (a wide
+    // time-range scan can still do a lot of I/O before hitting the row
+    // limit) — set here so every query issued through this client carries
+    // it, rather than threading it through every `sql::translate*` call.
     let ch = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
-        .with_database(&args.clickhouse_db);
+        .with_database(&args.clickhouse_db)
+        .with_option("max_execution_time", "30");
 
     let metrics_handle = PrometheusBuilder::new().install_recorder()?;
 
@@ -75,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
                 async move { h.render() }
             }),
         )
-        .merge(handlers::build_router(state))
+        .merge(
+            handlers::build_router(state)
+                .layer(ConcurrencyLimitLayer::new(args.max_concurrent_queries)),
+        )
         .layer(axum::middleware::from_fn(handlers::track_metrics));
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

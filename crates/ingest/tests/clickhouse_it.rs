@@ -62,15 +62,15 @@ async fn insert_and_read_back_roundtrips_map_and_fixedstring() {
         .as_nanos() as i64;
 
     let row = LogRow {
-        tenant_id: tenant.clone(),
+        tenant_id: tenant.as_str().into(),
         ts,
         severity: "INFO".to_string(),
-        service: "ingest-it".to_string(),
+        service: "ingest-it".into(),
         trace_id: "0123456789abcdef0123456789abcdef".to_string(), // 32 hex chars
         span_id: "0123456789abcdef".to_string(),                  // 16 hex chars
         body: "hello from the integration test".to_string(),
         attrs: attrs.clone(),
-        resource: resource.clone(),
+        resource: std::sync::Arc::new(resource.clone()),
     };
 
     let mut buf = vec![row.clone()];
@@ -88,7 +88,7 @@ async fn insert_and_read_back_roundtrips_map_and_fixedstring() {
 
     assert_eq!(got.len(), 1);
     let back = &got[0];
-    assert_eq!(back.tenant_id, tenant);
+    assert_eq!(&*back.tenant_id, tenant.as_str());
     assert_eq!(back.ts, row.ts);
     assert_eq!(
         back.trace_id, row.trace_id,
@@ -99,7 +99,7 @@ async fn insert_and_read_back_roundtrips_map_and_fixedstring() {
         "FixedString(16) span_id round-trips"
     );
     assert_eq!(back.attrs, attrs, "Map(...) attrs round-trips");
-    assert_eq!(back.resource, resource, "Map(...) resource round-trips");
+    assert_eq!(*back.resource, resource, "Map(...) resource round-trips");
 
     ch.query("DROP TABLE logs").execute().await.ok();
 }

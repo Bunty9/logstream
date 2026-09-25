@@ -18,6 +18,7 @@
 use clickhouse::Row;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// One log record as written to ClickHouse.
 ///
@@ -27,6 +28,19 @@ use std::collections::BTreeMap;
 /// deterministic key order so identical records hash identically (helps
 /// dedup tooling downstream) — see the `map_as_pairs` helper for why the
 /// wire format isn't a plain serde map.
+///
+/// `tenant_id`, `service`, and `resource` are `Arc`-wrapped: every log
+/// record in one OTLP request shares the same tenant, and every record
+/// under one `resource_logs` entry shares the same service/resource
+/// attributes, so `otlp_to_rows` builds each of these once and clones the
+/// `Arc` (a refcount bump) per row instead of deep-cloning a `String`/
+/// `BTreeMap` per row — a 16 MiB request can hold millions of tiny
+/// records, and that per-row deep clone was the dominant memory cost.
+/// `serde`'s `rc` feature (enabled workspace-wide) gives `Arc<str>`
+/// `Serialize`/`Deserialize` for free; `map_as_pairs` is generic over
+/// anything that `Borrow`s/`From`s a `BTreeMap` so it covers both the
+/// plain `BTreeMap` (`attrs`, unique per row already) and `Arc<BTreeMap>`
+/// (`resource`) with one implementation.
 ///
 /// `ts` is encoded as nanoseconds since Unix epoch — the wire shape that
 /// the `clickhouse` crate maps to `DateTime64(9, 'UTC')` (confirmed against
@@ -39,10 +53,10 @@ use std::collections::BTreeMap;
 /// string (no trace context) packs as all-zero bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, Row)]
 pub struct LogRow {
-    pub tenant_id: String,
+    pub tenant_id: Arc<str>,
     pub ts: i64,
     pub severity: String,
-    pub service: String,
+    pub service: Arc<str>,
     #[serde(with = "fixed_string::n32")]
     pub trace_id: String,
     #[serde(with = "fixed_string::n16")]
@@ -51,10 +65,13 @@ pub struct LogRow {
     #[serde(with = "map_as_pairs")]
     pub attrs: BTreeMap<String, String>,
     #[serde(with = "map_as_pairs")]
-    pub resource: BTreeMap<String, String>,
+    pub resource: Arc<BTreeMap<String, String>>,
 }
 
-/// `Map(LowCardinality(String), String)` <-> `BTreeMap<String, String>`.
+/// `Map(LowCardinality(String), String)` <-> `BTreeMap<String, String>`,
+/// generic over anything that borrows/produces a `BTreeMap` so it serves
+/// both a plain `BTreeMap` field (`attrs`) and an `Arc<BTreeMap>` field
+/// (`resource`) without duplicating the (de)serialization logic.
 ///
 /// clickhouse-rs's RowBinary (de)serializer has no `Map` support — it wants
 /// what `Map(K, V)` actually is on the wire, `Array((K, V))` — so a plain
@@ -63,11 +80,14 @@ pub struct LogRow {
 mod map_as_pairs {
     use super::*;
     use serde::ser::SerializeSeq;
+    use std::borrow::Borrow;
 
-    pub fn serialize<S: Serializer>(
-        map: &BTreeMap<String, String>,
-        ser: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<T, S>(map: &T, ser: S) -> Result<S::Ok, S::Error>
+    where
+        T: Borrow<BTreeMap<String, String>>,
+        S: Serializer,
+    {
+        let map = map.borrow();
         let mut seq = ser.serialize_seq(Some(map.len()))?;
         for kv in map {
             seq.serialize_element(&kv)?;
@@ -75,12 +95,15 @@ mod map_as_pairs {
         seq.end()
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        de: D,
-    ) -> Result<BTreeMap<String, String>, D::Error> {
+    pub fn deserialize<'de, D, T>(de: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: From<BTreeMap<String, String>>,
+    {
         Ok(Vec::<(String, String)>::deserialize(de)?
             .into_iter()
-            .collect())
+            .collect::<BTreeMap<String, String>>()
+            .into())
     }
 }
 
@@ -134,11 +157,15 @@ mod fixed_string {
     fixed_width_mod!(n16, 16);
 }
 
-/// One ingest hand-off across the bounded mpsc channel: rows are
-/// pre-grouped by tenant so the batcher can record per-tenant
-/// drop / flush metrics without re-keying.
-#[derive(Debug, Clone)]
+/// One ingest hand-off across the bounded mpsc channel: `rows` are the
+/// `LogRow`s projected from one request, and `permit` is the
+/// `--max-buffered-rows` semaphore permit covering all of them (see
+/// `crates/ingest/src/ingest.rs`) — the batcher merges it into its
+/// running permit and holds it until those rows are flushed (or dropped),
+/// then releases it, so total in-flight rows across the channel *and* the
+/// batcher's buffer stay bounded regardless of batch count.
+#[derive(Debug)]
 pub struct TenantBatch {
-    pub tenant_id: String,
     pub rows: Vec<LogRow>,
+    pub permit: tokio::sync::OwnedSemaphorePermit,
 }
