@@ -57,13 +57,28 @@ struct Args {
     #[arg(long, env = "LOGSTREAM_CHAN_CAPACITY", default_value_t = 1024)]
     chan_capacity: usize,
 
-    /// Flush threshold by row count.
-    #[arg(long, env = "LOGSTREAM_MAX_ROWS", default_value_t = 5_000)]
+    /// Flush threshold by row count. Default raised from the original
+    /// 5,000 to 50,000: ClickHouse amortizes per-insert overhead (network
+    /// round trip, part creation) over the batch, so small inserts issued
+    /// one at a time were the throughput ceiling — see PROGRESS.md's bench
+    /// methodology note for the measurement.
+    #[arg(long, env = "LOGSTREAM_MAX_ROWS", default_value_t = 50_000)]
     max_rows: usize,
 
-    /// Flush threshold by elapsed milliseconds.
+    /// Flush threshold by elapsed milliseconds. Unchanged from the
+    /// original default — this is the ack-latency bound, not the
+    /// throughput knob (`--max-rows` is), so raising it would trade
+    /// latency for no measured throughput gain.
     #[arg(long, env = "LOGSTREAM_FLUSH_MS", default_value_t = 200)]
     flush_ms: u64,
+
+    /// Max ClickHouse inserts allowed in flight at once. The batcher
+    /// used to await each flush serially, leaving the buffer idle for the
+    /// whole insert's network round trip; running up to this many flushes
+    /// concurrently keeps new rows accumulating while earlier batches are
+    /// still being written. See `crates/core/src/batcher.rs`.
+    #[arg(long, env = "LOGSTREAM_FLUSH_CONCURRENCY", default_value_t = 4)]
+    flush_concurrency: usize,
 
     /// Max accepted request body size, in bytes (post gzip-decompression).
     #[arg(long, env = "LOGSTREAM_MAX_BODY_BYTES", default_value_t = DEFAULT_MAX_BODY_BYTES)]
@@ -107,7 +122,8 @@ async fn main() -> anyhow::Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<TenantBatch>(args.chan_capacity);
     let max_rows = args.max_rows;
     let flush_ms = args.flush_ms;
-    let batcher_handle = tokio::spawn(run_batcher(rx, ch, max_rows, flush_ms));
+    let flush_concurrency = args.flush_concurrency;
+    let batcher_handle = tokio::spawn(run_batcher(rx, ch, max_rows, flush_ms, flush_concurrency));
 
     let buffer_limit = Arc::new(Semaphore::new(args.max_buffered_rows));
     let state = AppState {

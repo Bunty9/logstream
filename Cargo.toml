@@ -38,7 +38,13 @@ http = "1"
 # Database / cache
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "macros", "json"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
-clickhouse = { version = "0.12", features = ["uuid", "time"] }
+# `lz4` is already a default feature of the `clickhouse` crate (compresses
+# both insert bodies and query responses) — listed explicitly so it stays
+# on even if a future edit adds `default-features = false` here. Confirmed
+# via `cargo bench`/loadgen runs (see PROGRESS.md's bench methodology
+# note) that this was already active in the baseline numbers; no separate
+# before/after exists for it.
+clickhouse = { version = "0.12", features = ["uuid", "time", "lz4"] }
 
 # OTLP (protobuf)
 prost = "0.13"

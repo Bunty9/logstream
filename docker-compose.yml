@@ -114,6 +114,12 @@ services:
       CLICKHOUSE_URL: http://clickhouse:8123
       CLICKHOUSE_DB: default
       RUST_LOG: info
+      # Throughput tunables — see README's tunables table for what each one
+      # trades off; overridable per-run (e.g. `LOGSTREAM_MAX_ROWS=100000
+      # docker compose up`) without rebuilding the image.
+      LOGSTREAM_MAX_ROWS: ${LOGSTREAM_MAX_ROWS:-50000}
+      LOGSTREAM_FLUSH_MS: ${LOGSTREAM_FLUSH_MS:-200}
+      LOGSTREAM_FLUSH_CONCURRENCY: ${LOGSTREAM_FLUSH_CONCURRENCY:-4}
     ports:
       - "${INGEST_PORT:-4318}:4318"
     entrypoint: ["/usr/local/bin/logstream-ingest"]

@@ -7,6 +7,8 @@
 # loadgen's own "accepted" counter and the DB disagree.
 #
 # Usage: INGEST_PORT=14318 CH_HTTP_PORT=18123 scripts/bench.sh
+# Override the sweep for a quicker ad-hoc run, e.g.:
+#   DURATION=15 BATCHES="500" CONCS="8 32" scripts/bench.sh
 
 set -uo pipefail
 
@@ -14,6 +16,8 @@ export INGEST_PORT="${INGEST_PORT:-4318}"
 export CH_HTTP_PORT="${CH_HTTP_PORT:-8123}"
 export PATH="$HOME/.cargo/bin:$PATH"
 DURATION="${DURATION:-30}"
+BATCHES="${BATCHES:-500 1000}"
+CONCS="${CONCS:-8 32 64}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -32,8 +36,8 @@ ch_count() {
     curl -sS "${CH_URL}/" --data-binary "SELECT count() FROM logs WHERE tenant_id='demo' FORMAT TSV" | tr -d '[:space:]'
 }
 
-for batch in 500 1000; do
-    for conc in 8 32 64; do
+for batch in $BATCHES; do
+    for conc in $CONCS; do
         echo
         echo "== batch=$batch concurrency=$conc duration=${DURATION}s =="
         before=$(ch_count)

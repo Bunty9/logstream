@@ -80,6 +80,17 @@ struct Args {
     /// service.name resource attribute.
     #[arg(long, default_value = "checkout")]
     service: String,
+
+    /// Per-request timeout in seconds. Without this, a request whose
+    /// connection hangs (server killed mid-response, network black hole)
+    /// blocks its worker task forever — the worker never checks
+    /// `--duration`'s deadline because it's parked inside
+    /// `client.request(...).await`, so one bad request could hang the
+    /// whole run well past its intended duration (observed: 30+ minutes).
+    /// A timed-out request counts as a transport error, same as a
+    /// connection failure.
+    #[arg(long, default_value_t = 10)]
+    timeout_secs: u64,
 }
 
 #[derive(Default)]
@@ -122,6 +133,7 @@ async fn main() {
         ),
     };
 
+    let timeout = Duration::from_secs(args.timeout_secs);
     let start = Instant::now();
     let handles: Vec<_> = (0..args.concurrency)
         .map(|w| {
@@ -131,6 +143,7 @@ async fn main() {
                 uri.clone(),
                 remaining.clone(),
                 deadline,
+                timeout,
                 (w as u64).wrapping_mul(1_000_003),
             ))
         })
@@ -188,6 +201,7 @@ async fn run_worker(
     uri: Uri,
     remaining: Arc<AtomicI64>,
     deadline: Option<Instant>,
+    timeout: Duration,
     seq_base: u64,
 ) -> WorkerStats {
     let mut stats = WorkerStats::default();
@@ -208,13 +222,22 @@ async fn run_worker(
         let req = build_http_request(&uri, &args.key, args.gzip, body);
 
         let sent_at = Instant::now();
-        match client.request(req).await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                // Drain the body so the connection can be reused for the
-                // next request on this worker (hyper won't pool a
-                // connection whose response body wasn't fully read).
-                let _ = resp.into_body().collect().await;
+        // Bounded by `--timeout-secs`: without this, a request whose
+        // connection never resolves (server vanished) parks this worker
+        // in `client.request(...).await` forever — the deadline check
+        // above only runs *between* requests, so a single hung request
+        // can keep the whole run alive far past `--duration`.
+        // The timeout also covers draining the body, so a connection that
+        // stalls after the headers can't hang the worker either. Draining
+        // lets hyper reuse the connection for this worker's next request.
+        let exchange = async {
+            let resp = client.request(req).await?;
+            let status = resp.status().as_u16();
+            let _ = resp.into_body().collect().await;
+            Ok::<_, hyper_util::client::legacy::Error>(status)
+        };
+        match tokio::time::timeout(timeout, exchange).await {
+            Ok(Ok(status)) => {
                 stats
                     .latencies_us
                     .push(sent_at.elapsed().as_micros() as u64);
@@ -224,7 +247,7 @@ async fn run_worker(
                     stats.records_accepted += args.batch as u64;
                 }
             }
-            Err(_) => stats.transport_errors += 1,
+            Ok(Err(_)) | Err(_) => stats.transport_errors += 1,
         }
     }
     stats

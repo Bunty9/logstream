@@ -181,7 +181,9 @@ for want in logstream ClickHouse Prometheus; do
     fi
 done
 
-echo "$ds_json" | jq -c '.[] | {id, uid, name}' 2>/dev/null | while read -r row; do
+# Process substitution, not a pipe: a piped `while` runs in a subshell and
+# `fail`'s FAILED=1 would be lost.
+while read -r row; do
     uid=$(echo "$row" | jq -r .uid)
     name=$(echo "$row" | jq -r .name)
     id=$(echo "$row" | jq -r .id)
@@ -192,25 +194,19 @@ echo "$ds_json" | jq -c '.[] | {id, uid, name}' 2>/dev/null | while read -r row;
         health=$(curl -sS -u admin:admin "${GRAFANA_URL}/api/datasources/${id}/health" 2>/dev/null)
         hstatus=$(echo "$health" | jq -r '.status // empty' 2>/dev/null)
     fi
-    if [[ "$name" == "logstream" && "$hstatus" != "OK" ]]; then
-        # KNOWN GAP (query-side, not provisioning): Grafana's built-in Loki
-        # datasource health check always sends the literal probe query
-        # `vector(1)+vector(1)` to /loki/api/v1/query. Our LogQL grammar
-        # (crates/query/src/logql.rs) only implements the log-selector
-        # subset ("{label=...} filter*"), not Loki's metric-query literals
-        # like `vector(N)`, so it 400s that probe specifically — this is
-        # not an auth or provisioning problem: the same header-authed
-        # request reaches logstream-query and gets a structured LogQL
-        # parse error back (not a 401), and /labels, /query_range, and
-        # /label/{name}/values (what dashboards/Explore actually use) all
-        # verified OK above. Reported here, not fixed: fixing it means
-        # widening the LogQL parser (crates/query/src/*), out of this
-        # script's scope.
-        echo "  info: datasource '$name' health = ${hstatus:-unknown} ($health) -- KNOWN GAP: Grafana's Loki healthcheck probes 'vector(1)+vector(1)', which our LogQL subset doesn't parse; auth/proxy/labels/query_range all verified working independently above"
+    if [[ "$name" == "logstream" ]]; then
+        # Grafana's built-in Loki datasource health check always sends the
+        # literal probe query `vector(1)+vector(1)` to /loki/api/v1/query
+        # and expects a `vector` result equal to 2 (Grafana 11.2's
+        # pkg/tsdb/loki/healthcheck.go). logstream-query recognizes that
+        # exact expression (crates/query/src/handlers.rs,
+        # `is_vector_health_probe`) and answers it directly instead of
+        # running it through the LogQL parser.
+        [[ "$hstatus" == "OK" ]] && pass "datasource 'logstream' health = OK" || fail "datasource 'logstream' health = ${hstatus:-unknown} ($health)"
     else
         echo "  info: datasource '$name' health = ${hstatus:-unknown} ($health)"
     fi
-done
+done < <(echo "$ds_json" | jq -c '.[] | {id, uid, name}' 2>/dev/null)
 
 search_json=$(curl -sS -u admin:admin "${GRAFANA_URL}/api/search")
 if echo "$search_json" | jq -e '.[] | select(.type=="dash-db")' >/dev/null 2>&1; then
@@ -222,7 +218,13 @@ fi
 # === 6. graceful shutdown: sent rows must be flushed on SIGTERM ============
 
 section "6. graceful shutdown flushes buffered rows"
-SHUTDOWN_TRACE="$(cargo run -q -p logstream-core --example hash_key -- "e2e-shutdown-trace-seed" | cut -c1-32)"
+# Timestamped seed, not a fixed string: the script is meant to be
+# rerunnable against a stack whose ClickHouse data persists between runs
+# (TEARDOWN defaults to 0). A fixed trace id here would accumulate rows
+# from every previous run under the same id, so a rerun would count last
+# run's 50 rows too and fail this check even though shutdown itself
+# flushed exactly 50 (observed: a second run reported 100/50 "flushed").
+SHUTDOWN_TRACE="$(cargo run -q -p logstream-core --example hash_key -- "e2e-shutdown-trace-$(date +%s%N)" | cut -c1-32)"
 "$LOADGEN" --url "${INGEST_URL}/v1/logs" --key TESTKEY --requests 1 --batch 50 \
     --trace-id "$SHUTDOWN_TRACE" --service checkout
 docker compose stop -t 10 logstream-ingest

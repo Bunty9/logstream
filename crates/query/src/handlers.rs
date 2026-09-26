@@ -381,16 +381,49 @@ struct LokiInstantParams {
     direction: Option<String>,
 }
 
+/// Grafana 11's built-in Loki datasource health check (`pkg/tsdb/loki/
+/// healthcheck.go`) always sends this exact instant query to
+/// `/loki/api/v1/query` and asserts the response is a `vector` result
+/// whose single sample equals `2` — it's a liveness probe, not a real
+/// LogQL query, and our grammar (`logql::parse`) has no metric-query
+/// support (`vector(...)`, arithmetic) to evaluate it with. Recognizing
+/// this one literal (whitespace stripped, so `vector(1) + vector(1)` also
+/// matches) and answering with Loki's own vector shape is the entire fix:
+/// everything else Grafana/Explore actually uses (`/query_range`,
+/// `/labels`, `/label/{name}/values`) already works against real data.
+fn is_vector_health_probe(query: &str) -> bool {
+    let stripped: String = query.chars().filter(|c| !c.is_whitespace()).collect();
+    stripped == "vector(1)+vector(1)"
+}
+
 /// Loki's instant-query endpoint. We don't have a notion of "value at
 /// exactly this instant" for log lines, so — like `query_range` — this
 /// returns everything in the trailing 1h window up to `time` (default
 /// now). Grafana mostly uses `query_range`; this exists so a datasource
-/// that calls the instant endpoint still gets a sane answer.
+/// that calls the instant endpoint still gets a sane answer. The one
+/// exception is the health-check probe handled by `is_vector_health_probe`
+/// above.
 async fn loki_query(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<LokiInstantParams>,
 ) -> Result<Json<Value>, JsonErr> {
+    if is_vector_health_probe(&params.query) {
+        // Auth is still required — a probe with no/bad api key must not
+        // get a 200, same as every other route here.
+        require_tenant(&state, &headers)
+            .await
+            .map_err(|(s, m)| err_loki(s, m))?;
+        let now_secs = time_util::now_ns() as f64 / 1_000_000_000.0;
+        return Ok(Json(json!({
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [{ "metric": {}, "value": [now_secs, "2"] }],
+            },
+        })));
+    }
+
     let end = match params.time.as_deref() {
         Some(t) => {
             time_util::parse_str_to_ns(t).map_err(|m| err_loki(StatusCode::BAD_REQUEST, m))?
@@ -767,6 +800,65 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(resp.status().is_client_error() || resp.status().is_server_error());
+    }
+
+    #[tokio::test]
+    async fn loki_instant_health_probe_returns_vector_two() {
+        let app = build_router(authed_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/loki/api/v1/query?query=vector(1)%2Bvector(1)")
+            .header("x-api-key", "k")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["data"]["resultType"], "vector");
+        assert_eq!(v["data"]["result"][0]["value"][1], "2");
+    }
+
+    #[tokio::test]
+    async fn loki_instant_health_probe_is_whitespace_insensitive() {
+        let app = build_router(authed_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/loki/api/v1/query?query=vector(1)%20%2B%20vector(1)")
+            .header("x-api-key", "k")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["data"]["resultType"], "vector");
+    }
+
+    #[tokio::test]
+    async fn loki_instant_health_probe_still_requires_auth() {
+        let app = build_router(unauthed_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/loki/api/v1/query?query=vector(1)%2Bvector(1)")
+            .header("x-api-key", "nope")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn vector_health_probe_detection() {
+        assert!(is_vector_health_probe("vector(1)+vector(1)"));
+        assert!(is_vector_health_probe(" vector(1) + vector(1) "));
+        assert!(!is_vector_health_probe(r#"{service="api"}"#));
+        assert!(!is_vector_health_probe("vector(2)+vector(1)"));
     }
 
     #[test]
