@@ -25,17 +25,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const TS_WINDOW_PAST_NS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000; // 30 days, matches the table TTL
 const TS_WINDOW_FUTURE_NS: i64 = 60 * 60 * 1_000_000_000; // 1h of tolerated clock skew
 
+/// Total `log_records` across every `resource_logs[].scope_logs[]` in a
+/// decoded OTLP request — cheap to compute straight off the decoded
+/// protobuf (no per-record work), so callers that need to budget or
+/// reject on row count (the ingest handler's row-budget permit and `413`
+/// check) can do so *before* paying for `otlp_to_rows`'s per-row
+/// allocation and flattening.
+pub fn record_count(req: &ExportLogsServiceRequest) -> usize {
+    req.resource_logs
+        .iter()
+        .flat_map(|rl| rl.scope_logs.iter())
+        .map(|sl| sl.log_records.len())
+        .sum()
+}
+
 /// Project an OTLP logs request into the row representation persisted in
 /// ClickHouse. Tenant id is supplied by the auth layer — OTLP itself has
 /// no tenant concept.
 pub fn otlp_to_rows(tenant_id: String, req: &ExportLogsServiceRequest) -> Vec<LogRow> {
-    let total: usize = req
-        .resource_logs
-        .iter()
-        .flat_map(|rl| rl.scope_logs.iter())
-        .map(|sl| sl.log_records.len())
-        .sum();
-    let mut rows = Vec::with_capacity(total);
+    let mut rows = Vec::with_capacity(record_count(req));
 
     // Built once per request/resource and cloned (an `Arc` refcount bump)
     // per row rather than deep-cloned — see `LogRow`'s doc comment.
@@ -57,7 +65,7 @@ pub fn otlp_to_rows(tenant_id: String, req: &ExportLogsServiceRequest) -> Vec<Lo
         for scope_logs in &resource_logs.scope_logs {
             for record in &scope_logs.log_records {
                 let (ts, clamped) = row_ts_at(record, now);
-                if clamped {
+                if ts_clamp_was_rejection(record, clamped) {
                     metrics::counter!("logstream_ts_clamped_total").increment(1);
                 }
                 rows.push(LogRow {
@@ -112,6 +120,17 @@ fn row_ts_at(record: &LogRecord, now: SystemTime) -> (i64, bool) {
         return (ts, true);
     }
     (now_ns, true)
+}
+
+/// Whether `row_ts_at`'s fallback should count toward
+/// `logstream_ts_clamped_total`. `record.time_unix_nano == 0` is normal
+/// for SDK log bridges that only ever populate
+/// `observed_time_unix_nano` — that's an absent field, not a rejection,
+/// so it must not inflate the "we clamped a bad timestamp" metric. Only a
+/// nonzero `time_unix_nano` that `row_ts_at` actually fell back away from
+/// counts.
+fn ts_clamp_was_rejection(record: &LogRecord, clamped: bool) -> bool {
+    clamped && record.time_unix_nano != 0
 }
 
 /// Map OTLP `severity_number` ranges onto our fixed severity vocabulary,
@@ -375,6 +394,43 @@ mod tests {
     }
 
     #[test]
+    fn ts_clamp_metric_not_counted_when_time_unix_nano_unset() {
+        // time_unix_nano == 0 (unset) falling back to observed_time is
+        // normal for SDK log bridges — must not count as a "clamped" ts.
+        let record = LogRecord {
+            time_unix_nano: 0,
+            observed_time_unix_nano: 123,
+            ..Default::default()
+        };
+        let (_, clamped) = row_ts_at(&record, SystemTime::now());
+        assert!(clamped, "sanity: row_ts_at did fall back");
+        assert!(!ts_clamp_was_rejection(&record, clamped));
+    }
+
+    #[test]
+    fn ts_clamp_metric_counted_when_nonzero_time_unix_nano_rejected() {
+        let now = SystemTime::now();
+        let stale = now_ns(now) - 365 * 24 * 60 * 60 * 1_000_000_000i64;
+        let record = LogRecord {
+            time_unix_nano: stale as u64,
+            observed_time_unix_nano: stale as u64,
+            ..Default::default()
+        };
+        let (_, clamped) = row_ts_at(&record, now);
+        assert!(clamped);
+        assert!(ts_clamp_was_rejection(&record, clamped));
+    }
+
+    #[test]
+    fn ts_clamp_metric_not_counted_when_not_clamped() {
+        let record = LogRecord {
+            time_unix_nano: 1,
+            ..Default::default()
+        };
+        assert!(!ts_clamp_was_rejection(&record, false));
+    }
+
+    #[test]
     fn ts_falls_back_to_now_when_both_unset() {
         let now = SystemTime::now();
         let (got, clamped) = row_ts_at(&LogRecord::default(), now);
@@ -521,6 +577,28 @@ mod tests {
             )],
         }));
         assert_eq!(any_value_to_string(&kvlist), r#"{"inner":[false]}"#);
+    }
+
+    #[test]
+    fn record_count_matches_otlp_to_rows_row_count() {
+        let res_a = resource(vec![]);
+        let res_b = resource(vec![]);
+        let mut request = req(
+            res_a,
+            vec![vec![LogRecord::default()], vec![LogRecord::default()]],
+        );
+        request.resource_logs.push(ResourceLogs {
+            resource: Some(res_b),
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord::default()],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        });
+
+        assert_eq!(record_count(&request), 3);
+        assert_eq!(otlp_to_rows("t".into(), &request).len(), 3);
     }
 
     #[test]

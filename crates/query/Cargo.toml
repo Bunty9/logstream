@@ -18,7 +18,7 @@ path = "src/main.rs"
 logstream-core = { path = "../core" }
 tokio = { workspace = true }
 axum = { workspace = true }
-# `limit` for `tower::limit::ConcurrencyLimitLayer` (`--max-concurrent-queries`).
+# `limit` for `tower::limit::GlobalConcurrencyLimitLayer` (`--max-concurrent-queries`).
 tower = { workspace = true, features = ["limit"] }
 tower-http = { workspace = true }
 sqlx = { workspace = true }

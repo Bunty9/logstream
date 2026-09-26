@@ -3,7 +3,9 @@
 //! The cache is the hot path; Postgres is consulted on cache miss and
 //! revocation lag is bounded by the TTL.
 //!
-//! Unknown keys are negative-cached too (empty-string sentinel, 10s TTL):
+//! Unknown keys are negative-cached too (`"\0"` sentinel, 10s TTL — not
+//! `""`, which collides with a legitimately empty `tenant_id`; Postgres
+//! `TEXT` can't store a NUL byte, so no real tenant id can ever equal it):
 //! without it, a flood of random/garbage keys (typos, a leaked-then-rotated
 //! key still configured somewhere, an attacker probing) would hit Postgres
 //! on every single request forever, since a miss is never cached.
@@ -34,6 +36,12 @@ use std::pin::Pin;
 /// How long an unknown/revoked key is negative-cached in Redis before the
 /// next lookup is allowed to hit Postgres again.
 const NEGATIVE_CACHE_TTL_SECS: u64 = 10;
+/// Negative-cache marker for "no tenant found". Not `""`: Postgres `TEXT`
+/// can hold an empty string, so a real (if oddly provisioned) tenant id
+/// could be `""` and would then be misread as a cache miss turned
+/// negative-cache hit. `"\0"` is safe — Postgres `TEXT` cannot contain a
+/// NUL byte, so no real `tenant_id` can ever equal this sentinel.
+const NEGATIVE_CACHE_SENTINEL: &str = "\0";
 /// How long a resolved tenant id is cached in Redis.
 const POSITIVE_CACHE_TTL_SECS: u64 = 60;
 
@@ -73,7 +81,7 @@ impl TenantAuth {
 
         let mut redis = self.redis.clone();
         match redis.get::<_, Option<String>>(&cache_key).await {
-            Ok(Some(cached)) if cached.is_empty() => return Ok(None), // negative-cache hit
+            Ok(Some(cached)) if cached == NEGATIVE_CACHE_SENTINEL => return Ok(None), // negative-cache hit
             Ok(Some(tenant_id)) => return Ok(Some(tenant_id)),
             Ok(None) => {}
             Err(err) => tracing::warn!(%err, "redis lookup failed, falling back to postgres"),
@@ -89,7 +97,7 @@ impl TenantAuth {
 
         let Some((tenant_id,)) = row else {
             if let Err(err) = redis
-                .set_ex::<_, _, ()>(&cache_key, "", NEGATIVE_CACHE_TTL_SECS)
+                .set_ex::<_, _, ()>(&cache_key, NEGATIVE_CACHE_SENTINEL, NEGATIVE_CACHE_TTL_SECS)
                 .await
             {
                 tracing::warn!(%err, "redis negative-cache write failed");
@@ -176,5 +184,15 @@ mod tests {
     #[test]
     fn missing_both() {
         assert_eq!(api_key_from_headers(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn negative_cache_sentinel_cannot_equal_a_real_tenant_id() {
+        // The whole point of the sentinel: unlike the old `""` marker, a
+        // real (Postgres `TEXT`) tenant id can never equal it, so a
+        // negative-cache hit can never be misread as "tenant id is empty"
+        // or vice versa.
+        assert_ne!(NEGATIVE_CACHE_SENTINEL, "");
+        assert!(NEGATIVE_CACHE_SENTINEL.contains('\0'));
     }
 }

@@ -112,10 +112,30 @@ fn bind_one(q: clickhouse::query::Query, b: Bind) -> clickhouse::query::Query {
 /// server being unhealthy. Kept deliberately tiny — a code only belongs
 /// here if you can point at the exact user input that trips it; anything
 /// else risks turning a real outage into a swallowed 400.
-const USER_ERROR_CODES: &[(&str, &str)] = &[
-    ("Code: 427", "invalid regular expression in query"),
-    ("Code: 62", "invalid query syntax"),
+const USER_ERROR_CODES: &[(u32, &str)] = &[
+    (427, "invalid regular expression in query"),
+    (62, "invalid query syntax"),
 ];
+
+/// Extract the ClickHouse exception code from a `BadResponse` message.
+///
+/// The `clickhouse` crate (0.12, see `response.rs::extract_exception_slow`)
+/// formats these as `Code: <n>. DB::Exception: <description> (version ...)`,
+/// so the code is the run of digits right after the first `"Code: "`. A
+/// substring match (the previous approach) is wrong two ways: `"Code: 62"`
+/// also matches `"Code: 620"`..`"Code: 629"`, and it can match text that
+/// merely *contains* `"Code: 427."` anywhere — e.g. a syntax error whose
+/// description echoes the offending query, which may itself contain that
+/// literal substring. Anchoring on the first `"Code: "` and parsing the
+/// exact number avoids both.
+fn ch_exception_code(msg: &str) -> Option<u32> {
+    let after_prefix = &msg[msg.find("Code: ")? + "Code: ".len()..];
+    let digits: String = after_prefix
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
 
 /// Map a ClickHouse error to a client-facing status + sanitized message.
 /// The raw ClickHouse exception text (which can include table/column
@@ -127,8 +147,9 @@ fn ch_err(e: clickhouse::error::Error) -> (StatusCode, String) {
     tracing::error!(err = %e, "clickhouse query failed");
     match &e {
         clickhouse::error::Error::BadResponse(msg) => {
-            for (code, sanitized) in USER_ERROR_CODES {
-                if msg.contains(code) {
+            let code = ch_exception_code(msg);
+            for (want, sanitized) in USER_ERROR_CODES {
+                if code == Some(*want) {
                     return (StatusCode::BAD_REQUEST, sanitized.to_string());
                 }
             }
@@ -376,7 +397,9 @@ async fn loki_query(
         }
         None => time_util::now_ns(),
     };
-    let start = end - time_util::DEFAULT_RANGE_NS;
+    // `saturating_sub`: `end` is client-controlled, so it must clamp
+    // rather than panic for `end` near `i64::MIN`.
+    let start = end.saturating_sub(time_util::DEFAULT_RANGE_NS);
     let limit = params.limit.unwrap_or(sql::DEFAULT_LIMIT);
     let direction = Direction::parse(params.direction.as_deref())
         .map_err(|m| err_loki(StatusCode::BAD_REQUEST, m))?;
@@ -678,11 +701,72 @@ mod tests {
     }
 
     #[test]
+    fn ch_err_does_not_match_neighboring_codes_by_substring() {
+        // "Code: 62" must not match "Code: 621." (or any 620-629) — only
+        // the exact code 62.
+        let e = clickhouse::error::Error::BadResponse(
+            "Code: 621. DB::Exception: Unknown table 'x'".to_string(),
+        );
+        let (status, msg) = ch_err(e);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(msg, "upstream error");
+    }
+
+    #[test]
+    fn ch_err_ignores_error_code_text_echoed_elsewhere_in_the_message() {
+        // The real code is 62 (matches), but the exception's own
+        // description echoes a string containing "Code: 427." — a naive
+        // substring search anywhere in the message would wrongly report
+        // the regex error instead of the syntax error.
+        let e = clickhouse::error::Error::BadResponse(
+            "Code: 62. DB::Exception: Syntax error: failed at position 42 \
+             ('Code: 427.'): Code: 427. WHERE body = 'boom' (version 24.8.1)"
+                .to_string(),
+        );
+        let (status, msg) = ch_err(e);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "invalid query syntax");
+    }
+
+    #[test]
+    fn ch_exception_code_parses_realistic_message() {
+        assert_eq!(
+            ch_exception_code(
+                "Code: 427. DB::Exception: Cannot compile regular expression: (unmatched"
+            ),
+            Some(427)
+        );
+        assert_eq!(ch_exception_code("no code here"), None);
+    }
+
+    #[test]
     fn ch_err_maps_network_error_to_503() {
         let e = clickhouse::error::Error::Network(Box::new(std::io::Error::other("boom")));
         let (status, msg) = ch_err(e);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(msg, "upstream error");
+    }
+
+    #[tokio::test]
+    async fn loki_query_with_extreme_negative_time_does_not_panic() {
+        // Regression test for the `end - DEFAULT_RANGE_NS` overflow this
+        // handler used to have: `time` this close to `i64::MIN` must not
+        // panic when computing the default window's `start`. The request
+        // still fails (unreachable ClickHouse), but it must fail as an
+        // HTTP error response, not a panic.
+        let app = build_router(authed_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/loki/api/v1/query?query={}&time={}",
+                "%7Bservice%3D%22api%22%7D",
+                i64::MIN
+            ))
+            .header("x-api-key", "k")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error() || resp.status().is_server_error());
     }
 
     #[test]

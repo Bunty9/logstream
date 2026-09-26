@@ -4,7 +4,7 @@
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE api_keys (
+CREATE TABLE IF NOT EXISTS api_keys (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   key_hash     TEXT NOT NULL UNIQUE,
   tenant_id    TEXT NOT NULL,
@@ -12,4 +12,4 @@ CREATE TABLE api_keys (
   revoked_at   TIMESTAMPTZ
 );
 
-CREATE INDEX idx_api_keys_tenant ON api_keys (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id);

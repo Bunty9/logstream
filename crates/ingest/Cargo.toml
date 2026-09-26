@@ -31,6 +31,11 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 clap = { workspace = true }
+# `LengthLimitError`, to tell a `to_bytes` size-cap error (413) apart from
+# any other body-read error (400, e.g. corrupt gzip) via the error source
+# chain. Already pulled into Cargo.lock transitively (see the
+# `[dev-dependencies]` comment below), so this adds no new crate.
+http-body-util = "0.1"
 
 [dev-dependencies]
 # `util` for `ServiceExt::oneshot` in handler tests; not needed by the
@@ -38,3 +43,10 @@ clap = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 blake3 = { workspace = true }
 flate2 = "1"
+# HTTP client for `examples/loadgen.rs`. Not reqwest: `hyper-util` (with
+# its `client-legacy` connection-pooled client) and `http-body-util` are
+# already pulled into Cargo.lock transitively by the `clickhouse` crate,
+# so enabling them here adds no new crate to the dependency tree.
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { version = "0.1.6", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"

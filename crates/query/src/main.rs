@@ -12,7 +12,7 @@ use logstream_query::handlers::{self, AppState};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::postgres::PgPoolOptions;
 use std::{net::SocketAddr, sync::Arc};
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -90,8 +90,17 @@ async fn main() -> anyhow::Result<()> {
             }),
         )
         .merge(
-            handlers::build_router(state)
-                .layer(ConcurrencyLimitLayer::new(args.max_concurrent_queries)),
+            // `GlobalConcurrencyLimitLayer`, not `ConcurrencyLimitLayer`:
+            // axum builds one `Service` per route and layers each
+            // independently, so a plain `ConcurrencyLimitLayer` here would
+            // hand every route (6 of them) its own semaphore — 6x the
+            // intended cap. `GlobalConcurrencyLimitLayer` owns a single
+            // `Arc<Semaphore>` that every `.layer()` call (one per route)
+            // shares, so the limit is enforced across all query routes
+            // combined.
+            handlers::build_router(state).layer(GlobalConcurrencyLimitLayer::new(
+                args.max_concurrent_queries,
+            )),
         )
         .layer(axum::middleware::from_fn(handlers::track_metrics));
 

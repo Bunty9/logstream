@@ -83,8 +83,11 @@ pub fn parse_json_to_ns(v: &Value) -> Result<i64, String> {
 /// resulting span to `MAX_RANGE_NS` (see its doc).
 pub fn resolve_range(start: Option<i64>, end: Option<i64>) -> (i64, i64) {
     let end = end.unwrap_or_else(now_ns);
-    let start = start.unwrap_or(end - DEFAULT_RANGE_NS);
-    let start = start.max(end - MAX_RANGE_NS);
+    // `saturating_sub`: `end` comes straight from client input (a parsed
+    // query-time value), so `end` near `i64::MIN` must clamp rather than
+    // panic on overflow.
+    let start = start.unwrap_or(end.saturating_sub(DEFAULT_RANGE_NS));
+    let start = start.max(end.saturating_sub(MAX_RANGE_NS));
     (start, end)
 }
 
@@ -173,5 +176,31 @@ mod tests {
         let (start, end) = resolve_range(Some(1_000), Some(1_000 + DEFAULT_RANGE_NS));
         assert_eq!(start, 1_000);
         assert_eq!(end, 1_000 + DEFAULT_RANGE_NS);
+    }
+
+    #[test]
+    fn end_near_i64_min_does_not_panic() {
+        // `end - DEFAULT_RANGE_NS` / `end - MAX_RANGE_NS` would overflow
+        // (panic in debug) for `end` this close to `i64::MIN`; both
+        // subtractions must saturate instead.
+        let (start, end) = resolve_range(None, Some(i64::MIN));
+        assert_eq!(end, i64::MIN);
+        assert_eq!(start, i64::MIN);
+    }
+
+    #[test]
+    fn extreme_negative_json_number_parses_and_resolves_without_panicking() {
+        // JSON's exponent notation doesn't need a decimal point, so
+        // `-1e300` is a valid JSON *number* (unlike as a bare query-string
+        // value, which `parse_str_to_ns` would reject) and lands in
+        // `parse_json_to_ns`'s float branch. `secs * 1e9` overflows to
+        // `-inf`, and Rust's `as i64` cast on that saturates to
+        // `i64::MIN` rather than panicking — feeding that straight into
+        // `resolve_range` must likewise not panic.
+        let end = parse_json_to_ns(&Value::from(-1e300)).unwrap();
+        assert_eq!(end, i64::MIN);
+        let (start, end) = resolve_range(None, Some(end));
+        assert_eq!(end, i64::MIN);
+        assert_eq!(start, i64::MIN);
     }
 }

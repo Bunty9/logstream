@@ -38,7 +38,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use logstream_core::{api_key_from_headers, otlp_to_rows, TenantBatch};
+use logstream_core::{api_key_from_headers, otlp_to_rows, record_count, TenantBatch};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
@@ -123,9 +123,23 @@ async fn logs(State(state): State<AppState>, req: Request) -> Response {
     // inflated body.
     let body = match axum::body::to_bytes(req.into_body(), state.max_body_bytes).await {
         Ok(b) => b,
-        Err(_) => {
-            record_status("413");
-            return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+        Err(err) => {
+            // Only a hit on the `max_body_bytes` length cap is a client
+            // payload-size problem (413) — `to_bytes` wraps `Limited`,
+            // whose length-limit failure is reported via the error's
+            // `source()` as `http_body_util::LengthLimitError` (see
+            // `axum::body::to_bytes`'s own doc example). Anything else
+            // (corrupt/truncated gzip from `RequestDecompressionLayer`, a
+            // connection drop mid-body, ...) isn't a size problem, so it's
+            // a generic 400 rather than a possibly-misleading 413.
+            let is_length_limit = std::error::Error::source(&err)
+                .is_some_and(|src| src.is::<http_body_util::LengthLimitError>());
+            if is_length_limit {
+                record_status("413");
+                return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+            }
+            record_status("400");
+            return (StatusCode::BAD_REQUEST, "bad body").into_response();
         }
     };
 
@@ -137,8 +151,13 @@ async fn logs(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
-    let rows = otlp_to_rows(tenant_id, &decoded);
-    let row_count = rows.len();
+    // Row count comes straight off the decoded protobuf (`record_count`),
+    // *before* `otlp_to_rows` builds a single `LogRow` — that way the
+    // 413/permit checks below reject an oversized or budget-exceeding
+    // request without ever materializing its rows, bounding peak memory
+    // under 429 pressure instead of paying for the full allocation only
+    // to throw it away.
+    let row_count = record_count(&decoded);
 
     if row_count > state.max_buffered_rows || row_count > u32::MAX as usize {
         record_status("413");
@@ -159,6 +178,7 @@ async fn logs(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
+    let rows = otlp_to_rows(tenant_id, &decoded);
     let batch = TenantBatch { rows, permit };
 
     match state.sender.try_send(batch) {
@@ -274,6 +294,20 @@ mod tests {
                         }],
                         ..Default::default()
                     }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn request_with_n_records(n: usize) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: (0..n).map(|_| LogRecord::default()).collect(),
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),
@@ -425,6 +459,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_count_is_computed_before_rows_are_built() {
+        // Regression test for the row-budget ordering fix: the row count
+        // used for the 413 check and the permit acquisition must come
+        // from the decoded request directly (`record_count`), not from
+        // `rows.len()` after `otlp_to_rows` already built every row.
+        // Exercised with >1 record across the request so the decoded
+        // count and the built-row count genuinely have to agree; a
+        // budget of 2 against 5 records must reject via 413 without a
+        // batch ever reaching the channel.
+        let (state, mut rx) = state_with(4, 2);
+        let app = app(state);
+        let body = request_with_n_records(5).encode_to_vec();
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/v1/logs")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .header("x-api-key", "TESTKEY")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn happy_path_returns_protobuf_and_forwards_rows() {
         let (state, mut rx) = state_with(4, 1_000_000);
         let app = app(state);
@@ -515,6 +576,39 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "an oversized body must never reach the channel"
+        );
+    }
+
+    /// A corrupt gzip stream (well within `max_body_bytes`) must fail as
+    /// `400` ("bad body"), not `413` — the old code mapped *every*
+    /// `to_bytes` error to 413 regardless of cause. `RequestDecompressionLayer`
+    /// surfaces the flate2 decode failure as a body-read error with no
+    /// `LengthLimitError` in its source chain, which is exactly the case
+    /// this fix distinguishes from a real length-limit hit.
+    #[tokio::test]
+    async fn corrupt_gzip_body_is_400_not_413() {
+        let (state, mut rx) = state_with(4, 1_000_000);
+        let app = app(state);
+
+        // Valid gzip magic bytes followed by garbage: passes the
+        // decompression layer's initial sniff but fails mid-stream.
+        let bogus_gzip = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff];
+
+        let resp = app
+            .oneshot(
+                HttpRequest::post("/v1/logs")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .header("x-api-key", "TESTKEY")
+                    .body(axum::body::Body::from(bogus_gzip))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            rx.try_recv().is_err(),
+            "a corrupt body must never reach the channel"
         );
     }
 }

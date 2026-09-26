@@ -39,21 +39,7 @@ async fn cache_key_is_hashed_not_plaintext() {
         .await
         .expect("connect to postgres");
 
-    let migration_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0001_init.sql"
-    );
-    let migration = std::fs::read_to_string(migration_path).expect("read migrations/0001_init.sql");
-    for stmt in migration
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        sqlx::query(stmt)
-            .execute(&pg)
-            .await
-            .expect("apply migration statement");
-    }
+    migrate(&pg).await;
 
     let api_key = "TESTKEY-it";
     let key_hash = blake3::hash(api_key.as_bytes()).to_hex().to_string();
@@ -111,8 +97,9 @@ async fn cache_key_is_hashed_not_plaintext() {
 
 /// Verifies the negative-caching fix in `crates/core/src/auth.rs`: an
 /// unknown key resolves to `Ok(None)` (not an error), and the miss gets
-/// cached in Redis as an empty-string sentinel with a short TTL — so a
-/// flood of requests using a never-valid key doesn't hit Postgres on every
+/// cached in Redis as a `"\0"` sentinel (not `""`, which would collide
+/// with a legitimately empty `tenant_id`) with a short TTL — so a flood
+/// of requests using a never-valid key doesn't hit Postgres on every
 /// single one of them.
 #[tokio::test]
 async fn unknown_key_is_negative_cached() {
@@ -133,19 +120,7 @@ async fn unknown_key_is_negative_cached() {
         .await
         .expect("connect to postgres");
 
-    let migration_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0001_init.sql"
-    );
-    let migration = std::fs::read_to_string(migration_path).expect("read migrations/0001_init.sql");
-    for stmt in migration
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        // Idempotent re-apply across test binaries sharing one container.
-        sqlx::query(stmt).execute(&pg).await.ok();
-    }
+    migrate(&pg).await;
 
     let redis_client = redis::Client::open(redis_url).expect("open redis client");
     let manager = redis_client
@@ -176,7 +151,30 @@ async fn unknown_key_is_negative_cached() {
         .expect("redis GET");
     assert_eq!(
         cached.as_deref(),
-        Some(""),
-        "an unknown key is negative-cached as an empty-string sentinel"
+        Some("\0"),
+        "an unknown key is negative-cached as the \\0 sentinel, not an empty string"
     );
+}
+
+/// Apply `migrations/0001_init.sql` under a transaction-scoped advisory
+/// lock: tests in this binary run in parallel against one database, and
+/// concurrent `CREATE ... IF NOT EXISTS` can still race in the catalog.
+async fn migrate(pg: &sqlx::PgPool) {
+    let migration = include_str!("../../../migrations/0001_init.sql");
+    let mut tx = pg.begin().await.expect("begin migration tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(7331)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
+    for stmt in migration
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .expect("apply migration statement");
+    }
+    tx.commit().await.expect("commit migration");
 }
