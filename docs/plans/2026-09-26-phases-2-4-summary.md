@@ -148,7 +148,8 @@ tables/loss-test writeup in `PROGRESS.md`.
   (ClickHouse Cloud / Hetzner / Fly.io per the original spec's §5) as not
   yet started; today's only deployment target is the local
   `docker-compose.yml` stack.
-- **CI on GitHub**: `.github/workflows/ci.yml` (fmt, clippy, nextest,
-  cargo-deny, criterion compile check, gated integration tests, `docker
-  build`) had only been exercised locally when this summary was written;
-  its first GitHub run is the push that published this work.
+- **CI on GitHub**: first runs on 2026-09-26 surfaced two CI-only bugs
+  (missing `PGPASSWORD` in the migration step; the ingest ClickHouse
+  integration test dropping `default.logs` while the query crate's test
+  used it). Both fixed; run 36220041790 is green across test (stable,
+  beta), integration, cargo-deny, docker build and criterion.
