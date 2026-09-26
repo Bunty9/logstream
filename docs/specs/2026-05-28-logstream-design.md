@@ -1,6 +1,6 @@
 ---
 title: logstream — OTel + ClickHouse log ingestion (P3)
-status: draft
+status: implemented
 date: 2026-05-28
 related:
     - ../../../backend-cloud-roadmap.md
@@ -231,3 +231,93 @@ impl TenantAuth {
 - Vector.dev architecture.
 - ClickHouse docs on inserts + bloom filter indexes.
 - OpenObserve, Uptrace (Rust + ClickHouse stacks for prior art).
+
+## 9. As-built deviations (2026-09-26)
+
+Concrete differences between what shipped (`crates/*/src`,
+`clickhouse/init.sql`, `migrations/0001_init.sql`) and this spec's
+original §2–§4 sketch, with the one-line reason for each. See
+`docs/operations.md` for full operational detail on any of these.
+
+- **Single shared bounded channel + a row-count semaphore, not a
+  per-tenant channel/batcher.** §2's diagram shows a per-tenant `bounded
+  mpsc` and per-tenant batcher actor; the shipped design
+  (`crates/ingest/src/main.rs`, `crates/core/src/batcher.rs`) runs one
+  process-wide `mpsc::channel<TenantBatch>` and one batcher task, with a
+  `tokio::sync::Semaphore` (`--max-buffered-rows`) bounding total
+  in-flight rows across every tenant combined. Simpler to reason about
+  and bound memory for, at the cost of one noisy tenant being able to
+  fill the shared channel/budget and 429 everyone else — acceptable
+  given the drop-newest-and-count backpressure policy already implies no
+  per-tenant fairness guarantee.
+- **Concurrent flushes, not one flush at a time.** §4.3's `run_batcher`
+  sketch `.await`s each flush serially. The shipped batcher spawns each
+  due flush into its own task, bounded by `--flush-concurrency`
+  (default 4), so new rows keep accumulating while earlier batches are
+  still being written — measured as the dominant throughput fix (see
+  `PROGRESS.md`'s bench table: ~50% higher accepted rec/s at moderate
+  concurrency, `429`s eliminated at c=8).
+- **`--max-rows` default raised from the spec's 5,000 to 50,000.**
+  Bigger batches amortize ClickHouse's per-insert overhead; measured
+  gain, smaller than concurrent flushes but still a real one (see
+  `PROGRESS.md`).
+- **Timestamp clamping**, absent from the spec entirely.
+  `crates/core/src/otlp.rs::row_ts_at` rejects `time_unix_nano` outside
+  `[now-30d, now+1h]` (falling back to `observed_time_unix_nano`, then
+  `now`) because the `logs` table is `PARTITION BY toYYYYMMDD(ts)` and
+  ClickHouse refuses an insert spanning more than 100 partitions — one
+  client with a wrong clock could otherwise fail an entire multi-tenant
+  flush.
+- **`Arc`-shared row fields**, not per-row owned `String`/`BTreeMap`.
+  `LogRow`'s `tenant_id`, `service`, and `resource` are `Arc<str>`/
+  `Arc<BTreeMap<..>>`, built once per OTLP request/resource and cloned
+  (refcount bump) per row, because a single 16 MiB request can decode
+  into millions of tiny records and per-row deep-cloning those fields was
+  the dominant memory cost.
+- **RowBinary serde helpers for `FixedString`/`Map`**, not a plain
+  derive. The spec's schema (§4.1) and `LogRow` sketch don't address the
+  wire format at all; the installed `clickhouse` crate (0.12) panics on
+  a plain `Map` derive (`serialize_map`/`deserialize_map` are
+  `unimplemented!()`) and silently corrupts `FixedString(N)` columns
+  given a length-prefixed `String`. `crates/core/src/types.rs` adds
+  `map_as_pairs` (shuttles through `Vec<(K, V)>`, which the crate does
+  support) and `fixed_string::{n16,n32}` (packs/unpacks a `[u8; N]`)
+  serde helper modules to bridge this.
+- **Auth returns `Result`, not `Option`; `503` on backend failure;
+  negative caching; a local in-process cache; hashed Redis keys.** §4.4's
+  `TenantAuth::lookup` sketch returns `Option<String>` (folding "invalid
+  key" and "backend down" into the same `None`) and caches under
+  `tenant:{api_key}` (plaintext). The shipped version
+  (`crates/core/src/auth.rs`) returns
+  `Result<Option<String>, AuthError>` so callers can map a genuine
+  Postgres outage to `503` (OTLP/Loki-retryable) instead of `401`
+  (terminal); negative-caches unknown keys (10s TTL, `"\0"` sentinel) so
+  a flood of garbage keys doesn't hit Postgres on every request; adds a
+  10s in-process `RwLock<HashMap>` cache in front of the Redis round
+  trip; and caches under `tenant:{blake3(api_key)}` so a Redis
+  `KEYS`/`SCAN`/dump can't leak live plaintext secrets.
+- **Protobuf response body, gzip request support, bearer-token auth
+  fallback** — none of which the spec's §4.2 sketch mentions. The
+  shipped `/v1/logs` handler returns a protobuf-encoded
+  `ExportLogsServiceResponse` (OTLP-HTTP exporters expect exactly this
+  shape, not the sketch's JSON `{"rejected": 0}`), accepts
+  `Content-Encoding: gzip` via `tower_http::decompression`, and accepts
+  `Authorization: Bearer <key>` as a fallback when `x-api-key` is absent.
+- **Query API is a LogQL subset plus a Loki HTTP subset**, not the bare
+  ClickHouse-SELECT sketch implied by §2's read-side diagram. Shipped:
+  a hand-rolled recursive-descent LogQL parser (`crates/query/src/logql.rs`,
+  stream selectors + line filters, no metric queries), translation to
+  parameterized ClickHouse SQL with every value bound rather than
+  interpolated (`crates/query/src/sql.rs`), and Grafana/Loki-compatible
+  routes (`/loki/api/v1/query_range`, `/query`, `/labels`,
+  `/label/{name}/values`) so Grafana's built-in Loki datasource works
+  against it directly — plus a hard-coded tenant filter on every
+  translated query, which the spec's read-side diagram doesn't call out
+  as a requirement at all.
+- **No `/v1/traces` yet.** Both the spec's architecture diagram (§2) and
+  `README.md`'s currently list `/v1/logs /v1/traces` on the ingest
+  endpoint; only `/v1/logs` is implemented. There is no traces table, no
+  OTLP traces protobuf decoding, and no trace-ingest route — `GET
+  /trace/{trace_id}` on the *query* side looks up log rows carrying that
+  `trace_id`, which is a different feature (trace-correlated log lookup,
+  not trace ingestion/storage).

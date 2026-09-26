@@ -5,7 +5,7 @@
 > sit alongside Vector / OpenObserve / Uptrace as a power-couple stack of
 > `axum + clickhouse-rs`.
 
-[![ci](https://img.shields.io/badge/ci-pending-lightgrey.svg)](./.github/workflows/ci.yml)
+[![ci](https://github.com/Bunty9/logstream/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/logstream/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
@@ -22,7 +22,7 @@ in flight at once, and serves a Grafana-compatible read API.
 ```
 +--------------+   OTLP/HTTP    +-----------------------+   batch insert    +---------------+
 | OTel SDK     | -------------> | axum ingest endpoint  | ----------------> | ClickHouse    |
-| (any lang)   |   protobuf     |  /v1/logs /v1/traces  |   async client    | logs, traces  |
+| (any lang)   |   protobuf     |  /v1/logs             |   async client    | logs          |
 +--------------+                +-----+-----------------+                   +-------+-------+
                                       |                                             |
                                       | tenant-key check (local TTL cache -> Redis -> PG) |
@@ -259,12 +259,25 @@ logstream/
   PROGRESS.md               # per-sprint tracker
 ```
 
+## Documentation
+
+- [`docs/operations.md`](./docs/operations.md) — operator runbook: deploy,
+  key management, client semantics, backpressure/data-loss model, metrics
+  and alerts, tuning, troubleshooting.
+- [`docs/specs/2026-05-28-logstream-design.md`](./docs/specs/2026-05-28-logstream-design.md)
+  — design spec, with as-built deviations in §9.
+- [`docs/plans/2026-09-26-phases-2-4-summary.md`](./docs/plans/2026-09-26-phases-2-4-summary.md)
+  — what phases 2–4 delivered and how it was verified.
+- [`PROGRESS.md`](./PROGRESS.md) — status tracker and benchmark results.
+- [`CLAUDE.md`](./CLAUDE.md) — contributor notes: commands, invariants,
+  local-environment gotchas.
+
 ## Roadmap
 
-Phase 1 (scaffold + compile) is the current sprint — see
-[`docs/plans/2026-05-28-logstream-phase-1-scaffold.md`](./docs/plans/2026-05-28-logstream-phase-1-scaffold.md).
-Subsequent phases (OTLP→row mapping, read API, Grafana datasource, benches
-at 100k events/s, deploy) are tracked in [`PROGRESS.md`](./PROGRESS.md).
+Phases 1–4 (scaffold, OTLP mapping + observability, query API, benchmarks)
+are done. Open items: `/v1/traces` ingest, `sqlx::query!` macros with
+`sqlx prepare` in CI, streaming query results, and the Phase 5 deploy
+(ClickHouse Cloud + Neon + Upstash). See [`PROGRESS.md`](./PROGRESS.md).
 
 ## License <a id="license"></a>
 
