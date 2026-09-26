@@ -31,7 +31,19 @@ async fn insert_and_read_back_roundtrips_map_and_fixedstring() {
         return;
     };
 
-    let ch = clickhouse::Client::default().with_url(&url);
+    // Own database: this test drops and recreates `logs`, which must not
+    // race the query crate's integration tests using `default.logs` when
+    // nextest runs both test binaries in parallel against one server.
+    const DB: &str = "logstream_it_ingest";
+    clickhouse::Client::default()
+        .with_url(&url)
+        .query(&format!("CREATE DATABASE IF NOT EXISTS {DB}"))
+        .execute()
+        .await
+        .unwrap();
+    let ch = clickhouse::Client::default()
+        .with_url(&url)
+        .with_database(DB);
 
     // Apply the real schema (not a hand-simplified stand-in) so this test
     // exercises the actual DDL other agents/services rely on.
