@@ -6,6 +6,10 @@ services:
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ""
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # clickhouse-server 24.8 blocks network access for the `default` user
+      # with an empty password unless this is set (otherwise only the
+      # container's local unix socket / localhost is allowed).
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
     ports:
       - "${CH_HTTP_PORT:-8123}:8123"   # HTTP
       - "${CH_NATIVE_PORT:-9000}:9000"   # native
@@ -17,7 +21,12 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      # 127.0.0.1, not localhost: inside this container "localhost"
+      # resolves IPv6-first to ::1, which nothing listens on here (no
+      # IPv6 loopback), so wget gets "connection refused" forever even
+      # though the server is up and fine on 127.0.0.1 — verified by
+      # `docker exec` (localhost fails, 127.0.0.1 succeeds instantly).
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -74,8 +83,14 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      # logstream-query has no `healthcheck:` (its distroless image ships
+      # no shell/curl/wget to run one) — `service_healthy` here is invalid
+      # config (compose refuses to start: a service with condition
+      # service_healthy must define a healthcheck). Grafana's own Loki
+      # datasource health check (run by the e2e script) is what actually
+      # proves logstream-query is serving.
       logstream-query:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - logstream_grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

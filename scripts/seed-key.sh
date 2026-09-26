@@ -32,12 +32,22 @@ hash_key() {
         return 0
     fi
 
-    # No blake3 available locally — tell user how to install
+    # Fall back to the workspace's own blake3 dependency via a tiny example
+    # binary (crates/core/examples/hash_key.rs) — no extra install needed
+    # when neither b3sum nor Python blake3 is on the host.
+    if command -v cargo &> /dev/null; then
+        (cd "$(dirname "${BASH_SOURCE[0]}")/.." && \
+            cargo run -q -p logstream-core --example hash_key -- "$key")
+        return 0
+    fi
+
+    # No blake3 hasher available locally — tell user how to install
     cat >&2 <<EOF
 Error: No blake3 hasher found. Please install one of:
 
   1. b3sum (Rust):      cargo install b3sum
   2. Python blake3:     pip install blake3
+  3. cargo (workspace): cargo run -p logstream-core --example hash_key -- "\$key"
 
 After installation, run: $0 "$API_KEY" "$TENANT"
 EOF
