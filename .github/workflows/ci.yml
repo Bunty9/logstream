@@ -114,16 +114,17 @@ jobs:
 
       - name: Apply ClickHouse schema
         run: |
-          curl --data-binary @clickhouse/init.sql \
+          curl -fsS --data-binary @clickhouse/init.sql \
             http://localhost:8123/?default_format=TSV
         timeout-minutes: 1
 
       - name: Apply Postgres migrations
         run: |
-          psql -U logstream -d logstream -f migrations/0001_init.sql
+          psql -v ON_ERROR_STOP=1 -U logstream -d logstream -f migrations/0001_init.sql
         env:
           PGHOST: localhost
           PGPORT: 5432
+          PGPASSWORD: logstream
         timeout-minutes: 1
 
       - name: cargo nextest (integration)
