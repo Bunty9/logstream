@@ -12,6 +12,16 @@ This workspace publishes three crates. The two binary crates depend on
 On 2026-09-28 crates.io had no crate named `logstream`, `logstream-core`,
 `logstream-ingest` or `logstream-query`.
 
+Released versions:
+
+| Version | Date       | Tag      |
+| ------- | ---------- | -------- |
+| 0.1.0   | 2026-09-28 | `v0.1.0` |
+
+The 0.1.0 release was checked after publishing: `cargo install` works for
+both binaries and docs.rs built the `logstream-core` and `logstream-query`
+docs.
+
 ## Metadata (already configured)
 
 Most fields are shared through `[workspace.package]` in `Cargo.toml`:

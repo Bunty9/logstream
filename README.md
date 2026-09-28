@@ -6,6 +6,8 @@
 > `axum + clickhouse-rs`.
 
 [![ci](https://github.com/Bunty9/logstream/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/logstream/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/logstream-core.svg)](https://crates.io/crates/logstream-core)
+[![docs.rs](https://img.shields.io/docsrs/logstream-core)](https://docs.rs/logstream-core)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
