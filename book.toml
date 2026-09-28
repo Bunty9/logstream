@@ -1,0 +1,14 @@
+[book]
+title = "logstream"
+description = "OTLP-HTTP log ingest into ClickHouse, with a LogQL/Loki-compatible read API"
+language = "en"
+# Sources are assembled from README.md, PROGRESS.md and docs/ by
+# scripts/build-docs.py; nothing in book-src/ is edited by hand.
+src = "book-src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/Bunty9/logstream"
+site-url = "/logstream/"

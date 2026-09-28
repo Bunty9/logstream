@@ -263,6 +263,10 @@ logstream/
 
 ## Documentation
 
+The guides below are published as a site at
+<https://bunty9.github.io/logstream/>, and the Rust API docs are on
+[docs.rs](https://docs.rs/logstream-core).
+
 - [`docs/operations.md`](./docs/operations.md) — operator runbook: deploy,
   key management, client semantics, backpressure/data-loss model, metrics
   and alerts, tuning, troubleshooting.

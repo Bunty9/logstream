@@ -22,3 +22,7 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+
+# mdBook output and generated sources (scripts/build-docs.py)
+book/
+book-src/

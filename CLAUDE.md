@@ -101,6 +101,15 @@ and does not tear it down unless `TEARDOWN=1` is set. After that,
 - **Ingest checks run before the body is read.** Content-type and auth are
   checked first. The body limit applies after gzip decompression.
 
+## Documentation site
+
+The site at https://bunty9.github.io/logstream/ is an mdBook.
+`scripts/build-docs.py` assembles `book-src/` from README.md, PROGRESS.md and
+`docs/`, rewriting links that leave the book to GitHub URLs. A new doc page
+must be added to `PAGES` and `SUMMARY` in that script.
+`.github/workflows/docs.yml` deploys the site on pushes to `main` that touch
+the docs. To build locally, run `python3 scripts/build-docs.py && mdbook build`.
+
 ## Releasing
 
 See docs/publishing.md. All three crates share one version, and
