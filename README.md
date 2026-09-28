@@ -269,6 +269,8 @@ logstream/
 - [`docs/plans/2026-09-26-phases-2-4-summary.md`](./docs/plans/2026-09-26-phases-2-4-summary.md)
   — what phases 2–4 delivered and how it was verified.
 - [`PROGRESS.md`](./PROGRESS.md) — status tracker and benchmark results.
+- [`docs/publishing.md`](./docs/publishing.md) — crates.io metadata and
+  release checklist.
 - [`CLAUDE.md`](./CLAUDE.md) — contributor notes: commands, invariants,
   local-environment gotchas.
 

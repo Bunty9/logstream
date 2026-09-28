@@ -101,6 +101,13 @@ and does not tear it down unless `TEARDOWN=1` is set. After that,
 - **Ingest checks run before the body is read.** Content-type and auth are
   checked first. The body limit applies after gzip decompression.
 
+## Releasing
+
+See docs/publishing.md. All three crates share one version, and
+`rust-version` is 1.88 (the highest minimum any locked dependency declares).
+Always run `cargo publish --workspace --dry-run` first. A real publish cannot
+be undone, so only do it when explicitly asked.
+
 ## Conventions
 
 - Keep code minimal and idiomatic, and match the existing doc-comment density.

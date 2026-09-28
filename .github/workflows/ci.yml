@@ -35,6 +35,17 @@ jobs:
       - name: cargo nextest
         run: cargo nextest run --workspace --no-fail-fast
 
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo +1.88 check --workspace --all-targets --locked
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

@@ -160,7 +160,13 @@ async fn unknown_key_is_negative_cached() {
 /// lock: tests in this binary run in parallel against one database, and
 /// concurrent `CREATE ... IF NOT EXISTS` can still race in the catalog.
 async fn migrate(pg: &sqlx::PgPool) {
-    let migration = include_str!("../../../migrations/0001_init.sql");
+    // Read at runtime, not `include_str!`: the published crate doesn't ship
+    // the workspace's `migrations/`, and this test is env-gated anyway.
+    let migration = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/0001_init.sql"
+    ))
+    .expect("read migrations/0001_init.sql");
     let mut tx = pg.begin().await.expect("begin migration tx");
     sqlx::query("SELECT pg_advisory_xact_lock(7331)")
         .execute(&mut *tx)

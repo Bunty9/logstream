@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["logql", "loki", "clickhouse", "grafana", "observability"]
+categories = ["web-programming::http-server", "database"]
 description = "Grafana-compatible read API for logstream — thin SELECT layer over ClickHouse."
 
 [lib]

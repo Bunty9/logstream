@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["opentelemetry", "otlp", "clickhouse", "logging", "observability"]
+categories = ["database", "development-tools::debugging"]
 description = "Core types, tenant auth, OTLP mapping, and ClickHouse batcher for logstream."
 
 [lib]
