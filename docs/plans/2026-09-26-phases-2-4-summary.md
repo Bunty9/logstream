@@ -6,7 +6,7 @@ date: 2026-09-26
 # Phases 2-4 summary (2026-09-26)
 
 Phase 1 (scaffold + compile) is `docs/plans/2026-05-28-logstream-phase-1-scaffold.md`
-and commit `b46fde3`. This note covers everything since: Phase 2 (real
+and commit `b0d1fdf`. This note covers everything since: Phase 2 (real
 OTLP mapping + observability), Phase 3 (query API), and the "ops
 hardening + perf" sprint that followed it (`PROGRESS.md` doesn't number
 that sprint "Phase 4", but it's the fourth batch of work after the
@@ -17,15 +17,15 @@ scaffold, hence this doc's title).
 `git log --oneline` (oldest first):
 
 ```
-b46fde3 Initial commit: logstream L3 OTel to ClickHouse ingest       (Phase 1)
-367ab48 Implement OTLP mapping, harden ingest, add LogQL query API    (Phase 2 + 3)
-a37b390 Fix review findings: ts clamping, memory bounds, auth failure modes
-d7e9c67 Fix re-review findings in limits, error mapping and auth tests
-ed54bc2 Add end-to-end script, load generator and compose fixes
-d21b528 Concurrent flushes, local auth cache, Grafana Loki health, bench docs
+b0d1fdf Initial commit: logstream L3 OTel to ClickHouse ingest       (Phase 1)
+133f832 Implement OTLP mapping, harden ingest, add LogQL query API    (Phase 2 + 3)
+4ccc604 Fix review findings: ts clamping, memory bounds, auth failure modes
+d75326b Fix re-review findings in limits, error mapping and auth tests
+e4b9ad3 Add end-to-end script, load generator and compose fixes
+1d2c90a Concurrent flushes, local auth cache, Grafana Loki health, bench docs
 ```
 
-**`367ab48`** — the bulk of Phase 2 and Phase 3 in one commit:
+**`133f832`** — the bulk of Phase 2 and Phase 3 in one commit:
 
 - Real `otlp_to_rows` mapping (`crates/core/src/otlp.rs`):
   `resource_logs[].scope_logs[].log_records[]` walk, severity-number →
@@ -38,7 +38,7 @@ d21b528 Concurrent flushes, local auth cache, Grafana Loki health, bench docs
   (`crates/query/src/handlers.rs`).
 - Grafana provisioning (ClickHouse + Prometheus datasources, dashboard).
 
-**`a37b390` / `d7e9c67`** — review-driven hardening, not new features:
+**`4ccc604` / `d75326b`** — review-driven hardening, not new features:
 timestamp clamping (`row_ts_at`, the 30-day/1h window), `Arc`-sharing of
 `tenant_id`/`service`/`resource` to bound per-request memory, the
 `RowBinary` `FixedString`/`Map` serde helpers
@@ -51,11 +51,11 @@ row-materialization fix in the ingest handler (413/permit checks run
 against `record_count(&decoded)`, not `otlp_to_rows(..).len()`, so an
 oversized request never pays for the full allocation first).
 
-**`ed54bc2`** — `scripts/e2e.sh`, `crates/ingest/examples/loadgen.rs`
+**`e4b9ad3`** — `scripts/e2e.sh`, `crates/ingest/examples/loadgen.rs`
 (the OTLP load generator), and compose fixes (the ClickHouse
 `127.0.0.1`-not-`localhost` healthcheck, `CLICKHOUSE_SKIP_USER_SETUP`).
 
-**`d21b528`** — the ops-hardening/perf sprint: concurrent flushes in the
+**`1d2c90a`** — the ops-hardening/perf sprint: concurrent flushes in the
 batcher (`--flush-concurrency`, default 4 — the dominant throughput
 fix), `--max-rows` default raised 5,000 → 50,000, the in-process auth TTL
 cache in front of Redis (`crates/core/src/auth.rs`'s `local_cache`), the
